@@ -57,6 +57,21 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+struct BufferDefinition {
+	uint32_t variable             = 0;
+	uint32_t type                 = 0;
+	uint32_t element_type         = 0;
+	uint32_t pointer_type         = 0;
+	uint32_t element_pointer_type = 0;
+};
+
+struct ImageDefinition {
+	uint32_t variable     = 0;
+	uint32_t type         = 0;
+	uint32_t pointer_type = 0;
+	uint32_t sampled_type = 0;
+};
+
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -93,10 +108,7 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
-	uint32_t                                         storage_buffer_variable = 0;
-	uint32_t                                         storage_buffer_u8_variable = 0;
-	uint32_t                                         storage_buffer_u16_variable = 0;
-	uint32_t                                         storage_buffer_u64_variable = 0;
+	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
@@ -112,8 +124,10 @@ struct EmitterState {
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
-	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	std::array<ImageDefinition, IR::ImageBindingCount> images {};
 	uint32_t                   sampler_variable                      = 0;
+	uint32_t                   sampler_type                          = 0;
+	uint32_t                   sampler_pointer_type                  = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
 	uint32_t                   mesh_allocation                       = 0;
@@ -156,8 +170,6 @@ uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
-uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
-uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
@@ -405,7 +417,7 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
-                                                        uint32_t variable, uint32_t pointer_type);
+                                                        BufferDefinition& buffer);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
