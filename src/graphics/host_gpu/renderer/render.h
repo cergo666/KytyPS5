@@ -216,7 +216,6 @@ private:
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<uint32_t>                 m_image_occurrences;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
