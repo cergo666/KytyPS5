@@ -26,8 +26,10 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -225,13 +227,14 @@ struct PipelineCache::ProgramCache {
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
 		}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		// A deque keeps permutation addresses stable: draws awaiting execution hold pointers to
+		// them while later draws may add new permutations.
+		std::deque<Permutation>                     permutations;
 	};
 
 	struct ProgramKeyHash {
@@ -257,8 +260,13 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
+		std::optional<ShaderRecompiler::CompileResult> result_holder;
+		{
+			KYTY_PROFILER_BLOCK("SC::CompileProgram");
+			result_holder.emplace(ShaderRecompiler::CompileProgram(std::move(translated), options,
+			                                                       specialization, push_data_start_dword));
+		}
+		auto& result = *result_holder;
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
@@ -266,7 +274,11 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		const auto module = CompileSPV(result.spirv, device);
+		vk::ShaderModule module;
+		{
+			KYTY_PROFILER_BLOCK("SC::CreateModule");
+			module = CompileSPV(result.spirv, device);
+		}
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -292,13 +304,17 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		KYTY_PROFILER_BLOCK("PC::ProgramCache::Get");
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
+		{
+			KYTY_PROFILER_BLOCK("PC::BuildStageStaticKey");
+			BuildStageStaticKey(input_info, lookup_key.static_state);
+		}
+		auto                                         entry = [&] { KYTY_PROFILER_BLOCK("PC::programs.find"); return programs.find(lookup_key); }();
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -308,9 +324,13 @@ struct PipelineCache::ProgramCache {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			{
+				KYTY_PROFILER_BLOCK("PC::Materialize(hit)");
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    entry->second.resource_plan, runtime, entry->second.resources,
+				    entry->second.specialization));
+			}
+			KYTY_PROFILER_BLOCK("PC::FindPermutation");
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -368,8 +388,14 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		std::optional<ShaderRecompiler::TranslateResult> translated_holder;
+		{
+			KYTY_PROFILER_BLOCK("SC::Translate");
+			translated_holder.emplace(ShaderRecompiler::TranslateProgram(params.code, options));
+		}
+		auto& translated = *translated_holder;
 		if (entry == programs.end()) {
+			KYTY_PROFILER_BLOCK("SC::ExtractPlan");
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
@@ -398,6 +424,89 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	template <typename InputInfo>
+	static ShaderType StageOf(const InputInfo& input_info) {
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			return input_info.logical_stage;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			return ShaderType::Pixel;
+		} else {
+			return ShaderType::Compute;
+		}
+	}
+
+	// Command-processor thread only. Queues the resource materialization of a cached program on
+	// the worker. Programs seen for the first time are left to the synchronous path.
+	template <typename InputInfo>
+	AsyncGraphics::Stage SubmitAsync(AsyncMaterializer& async, size_t lane,
+	                                     const ShaderParams& params,
+	                                     const InputInfo& input_info, uint64_t dirty_epoch) {
+		lookup_key.stage           = StageOf(input_info);
+		lookup_key.hash            = params.hash;
+		lookup_key.user_data_count = params.user_data_count;
+		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, lookup_key.static_state);
+		const auto entry = programs.find(lookup_key);
+		if (entry == programs.end() || !entry->second.resource_plan.resource_tracking_complete) {
+			return {};
+		}
+		auto* task = async.Acquire();
+		if (task == nullptr) {
+			return {};
+		}
+		task->plan = &entry->second.resource_plan;
+		// A plan's evaluation scratch is not shared-safe, so a plan always maps to the same lane;
+		// different plans spread over all lanes.
+		static const size_t lanes_used = [] {
+			const char* env = std::getenv("KYTY_ASYNC_LANES");
+			const int   n   = env != nullptr ? std::atoi(env) : static_cast<int>(AsyncMaterializer::kLaneCount);
+			return static_cast<size_t>(std::clamp(n, 1, static_cast<int>(AsyncMaterializer::kLaneCount)));
+		}();
+		lane = static_cast<size_t>(
+		    (reinterpret_cast<uintptr_t>(task->plan) >> 4) * 0x9E3779B97F4A7C15ull >> 32u) % lanes_used;
+		std::copy_n(params.user_data.begin(), params.user_data_count, task->user_data.begin());
+		task->user_data_count      = params.user_data_count;
+		task->shader_base          = params.Base();
+		task->workgroup_count_size = 0;
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			std::copy_n(input_info.workgroup_counts, 3, task->workgroup_counts.begin());
+			task->workgroup_count_size = 3;
+		}
+		task->dirty_epoch          = dirty_epoch;
+		async.Submit(task, lane);
+		return {&entry->second, task, false};
+	}
+
+	// Uses a finished task when it is still valid and a matching permutation already exists;
+	// otherwise recomputes synchronously (after the worker has gone idle, because the shader's
+	// evaluation scratch is shared with the worker).
+	template <typename InputInfo>
+	ShaderProgram GetResolved(AsyncMaterializer* async, const ShaderParams& params,
+	                          InputInfo& input_info, uint32_t& push_data_cursor,
+	                          const AsyncGraphics::Stage& stage) {
+		if (stage.valid && stage.task != nullptr && stage.entry != nullptr) {
+			auto& entry = *static_cast<SourceEntry*>(stage.entry);
+			if (const auto permutation = std::ranges::find_if(
+			        entry.permutations, [&](const Permutation& candidate) {
+				        const auto& layout = candidate.program.bindings;
+				        return layout.push_data_start_dword ==
+				                   ShaderRecompiler::IR::PushData::StartFor(
+				                       push_data_cursor, layout.ShaderDataDwords()) &&
+				               candidate.specialization == stage.task->specialization;
+			        });
+			    permutation != entry.permutations.end()) {
+				input_info.stage = {.program = &permutation->program,
+				                    .resources = &stage.task->snapshot};
+				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				return permutation->handle;
+			}
+		}
+		if (async != nullptr) {
+			async->WaitIdle();
+		}
+		return Get(params, input_info, push_data_cursor);
+	}
+
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
@@ -418,11 +527,19 @@ struct PipelineCache::ProgramCache {
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+	// On by default; KYTY_ASYNC_DRAW=0 restores fully synchronous draw preparation.
+	if (const char* env = std::getenv("KYTY_ASYNC_DRAW"); env == nullptr || env[0] != '0') {
+		m_async = std::make_unique<AsyncMaterializer>();
+		PipelineCacheLog("Async draw preparation: enabled");
+	}
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }
 
 PipelineCache::~PipelineCache() {
+	if (m_async != nullptr) {
+		m_async->WaitIdle();
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -583,12 +700,16 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
-PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+PipelineCache::GraphicsPrepared PipelineCache::PrepareGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	KYTY_PROFILER_BLOCK("PC::PrepareGraphicsPrograms");
+	GraphicsPrepared prepared;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	prepared.tess_active  = tess_active;
+	prepared.pixel_active = pixel_active;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
@@ -666,27 +787,119 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
-	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms  result;
-	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+	prepared.vertex_params = vertex_params;
+	prepared.pixel_params  = pixel_params;
+	prepared.mesh_active   = mesh_active;
+	return prepared;
+}
+
+PipelineCache::GraphicsPrograms PipelineCache::ResolveGraphicsPrograms(
+    const GraphicsPrepared& prepared, std::array<ShaderVertexInputInfo, 3>& vertex_info,
+    ShaderPixelInputInfo& pixel_info) {
+	uint32_t push_data_cursor =
+	    prepared.mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	GraphicsPrograms result;
+	if (prepared.pixel_active) {
+		result.pixel = m_program_cache->Get(prepared.pixel_params, pixel_info, push_data_cursor);
 	}
-	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+	for (uint32_t i = 0; i < (prepared.tess_active ? 3u : 1u); i++) {
+		result.vertex[i] =
+		    m_program_cache->Get(prepared.vertex_params[i], vertex_info[i], push_data_cursor);
 	}
 	return result;
+}
+
+PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	KYTY_PROFILER_BLOCK("PC::GetGraphicsPrograms");
+	const auto prepared =
+	    PrepareGraphicsPrograms(vertex_regs, pixel_regs, sh, context, user_config,
+	                            target_export_mapping, pixel_active, vertex_info, pixel_info);
+	return ResolveGraphicsPrograms(prepared, vertex_info, pixel_info);
+}
+
+bool PipelineCache::SubmitGraphicsAsync(const GraphicsPrepared&                     prepared,
+                                        const std::array<ShaderVertexInputInfo, 3>& vertex_info,
+                                        const ShaderPixelInputInfo& pixel_info,
+                                        uint64_t dirty_epoch, AsyncGraphics& async) {
+	async = {};
+	if (m_async == nullptr || prepared.tess_active || prepared.mesh_active) {
+		return false;
+	}
+	if (prepared.pixel_active) {
+		async.pixel =
+		    m_program_cache->SubmitAsync(*m_async, 1, prepared.pixel_params, pixel_info, dirty_epoch);
+	}
+	async.vertex = m_program_cache->SubmitAsync(*m_async, 0, prepared.vertex_params[0],
+	                                            vertex_info[0], dirty_epoch);
+	return true;
+}
+
+PipelineCache::GraphicsPrograms PipelineCache::ResolveGraphicsProgramsAsync(
+    const GraphicsPrepared& prepared, const AsyncGraphics& async,
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	uint32_t         push_data_cursor = 0;
+	GraphicsPrograms result;
+	if (prepared.pixel_active) {
+		result.pixel = m_program_cache->GetResolved(m_async.get(), prepared.pixel_params,
+		                                            pixel_info, push_data_cursor, async.pixel);
+	}
+	result.vertex[0] = m_program_cache->GetResolved(m_async.get(), prepared.vertex_params[0],
+	                                                vertex_info[0], push_data_cursor, async.vertex);
+	return result;
+}
+
+void PipelineCache::ReleaseGraphicsAsync(AsyncGraphics& async) {
+	for (auto* stage: {&async.pixel, &async.vertex}) {
+		if (stage->task != nullptr) {
+			m_async->Release(stage->task);
+		}
+		*stage = {};
+	}
+}
+
+ShaderParams PipelineCache::PrepareComputeProgram(const HW::ComputeShaderInfo& regs,
+                                                  const HW::ShaderRegisters&   sh,
+                                                  ShaderComputeInputInfo&      input_info) {
+	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	const auto params             = PrepareProgram(regs, sh, input_info);
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	return params;
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
-	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-	const auto        params      = PrepareProgram(regs, sh, input_info);
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	const auto        params           = PrepareComputeProgram(regs, sh, input_info);
 	uint32_t          push_data_cursor = 0;
 	return m_program_cache->Get(params, input_info, push_data_cursor);
+}
+
+PipelineCache::AsyncGraphics::Stage PipelineCache::SubmitComputeAsync(
+    const ShaderParams& params, const ShaderComputeInputInfo& input_info, uint64_t dirty_epoch) {
+	if (m_async == nullptr) {
+		return {};
+	}
+	return m_program_cache->SubmitAsync(*m_async, 2, params, input_info, dirty_epoch);
+}
+
+ShaderProgram PipelineCache::ResolveComputeProgramAsync(const ShaderParams&         params,
+                                                        ShaderComputeInputInfo&     input_info,
+                                                        const AsyncGraphics::Stage& stage) {
+	uint32_t push_data_cursor = 0;
+	return m_program_cache->GetResolved(m_async.get(), params, input_info, push_data_cursor,
+	                                    stage);
+}
+
+void PipelineCache::ReleaseAsyncStage(AsyncGraphics::Stage& stage) {
+	if (stage.task != nullptr) {
+		m_async->Release(stage.task);
+	}
+	stage = {};
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

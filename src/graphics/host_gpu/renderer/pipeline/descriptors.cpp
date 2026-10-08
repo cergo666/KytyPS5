@@ -942,6 +942,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
+	KYTY_PROFILER_BLOCK("Draw::PrepareGraphicsBindings");
 	bool uses_dma = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
@@ -953,6 +954,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
+	KYTY_PROFILER_BLOCK("Draw::RT loop");
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
@@ -964,8 +966,11 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			}
 			target.desc.view_info.base_level = target.guest_mip_level;
 			target.desc.view_info.base_layer = target.guest_array_layer;
-			target.image_id = cache.FindImage(target.desc);
-			BindRenderTarget(target.image_id);
+			{
+				KYTY_PROFILER_BLOCK("Draw::RT FindImage+Bind");
+				target.image_id = cache.FindImage(target.desc);
+				BindRenderTarget(target.image_id);
+			}
 		}
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
@@ -1006,24 +1011,33 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
-	for (const auto* reader: prepared_bindings) {
-		const auto& reads = reader->runtime->resources->specialization_reads;
-		if (reads.empty()) continue;
-		for (const auto* writer: prepared_bindings) {
-			if (writer->runtime->program->has_address_writes) {
-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
-			}
+	{
+		// Scalar reads must be disjoint from everything the draw writes. Collect the written
+		// ranges once; each read is then checked against that short list instead of every
+		// bound image and buffer.
+		bool any_reads = false;
+		for (const auto* reader: prepared_bindings) {
+			any_reads |= !reader->runtime->resources->specialization_reads.empty();
 		}
-		for (const auto [address, size]: reads) {
+		if (any_reads) {
+			struct WrittenRange {
+				uint64_t address, size;
+				bool     image;
+			};
+			std::vector<WrittenRange> written_ranges;
+			for (const auto* writer: prepared_bindings) {
+				if (writer->runtime->program->has_address_writes) {
+					EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+				}
+			}
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+					if (written.size != 0) {
+						written_ranges.push_back({written.address, written.size, true});
 					}
 				}
 			}
@@ -1033,9 +1047,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto resource = program.bindings.descriptors.front().resources[i];
 					if (!program.info.buffers[resource].written) continue;
 					const auto& written = writer->buffer_sources[i];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+					if (written.size != 0) {
+						written_ranges.push_back({written.address, written.size, false});
+					}
+				}
+			}
+			for (const auto* reader: prepared_bindings) {
+				for (const auto [address, size]: reader->runtime->resources->specialization_reads) {
+					for (const auto& written: written_ranges) {
+						if (ImageRangeOverlaps(address, size, written.address, written.size)) {
+							EXIT(written.image
+							         ? "scalar resource reads overlap an image or attachment write\n"
+							         : "scalar resource reads overlap a shader buffer write\n");
+						}
 					}
 				}
 			}

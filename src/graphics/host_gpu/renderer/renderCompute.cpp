@@ -4,6 +4,8 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/renderer/renderDeferred.h"
+#include "graphics/host_gpu/renderer/renderDiag.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -204,6 +206,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	auto& cache = context.GetBufferCache();
 	if (indirect_args != 0) {
+		KYTY_PROFILER_BLOCK("Dsp::IndirectArgsRead");
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
@@ -228,6 +231,15 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	DispatchDirectImpl(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+	                   nullptr);
+}
+
+void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffer,
+                                        uint32_t thread_group_x, uint32_t thread_group_y,
+                                        uint32_t thread_group_z, uint32_t mode,
+                                        DeferredDraw* deferred) {
+	KYTY_PROFILER_BLOCK("Compute::DispatchDirect");
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -296,8 +308,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
-	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	ShaderProgram compute_program;
+	{
+	KYTY_PROFILER_BLOCK("Cmp::Program");
+	if (deferred != nullptr) {
+		// Prepared (and its resources materialized) when the dispatch was recorded.
+		input_info      = deferred->compute_info;
+		compute_program = m_context.GetPipelineCache().ResolveComputeProgramAsync(
+		    deferred->compute_params, input_info, deferred->compute_async);
+	} else {
+		compute_program =
+		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	}
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -306,12 +329,40 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	if (Diag::MetaEnabled()) {
+		static uint64_t last_hash = 0;
+		static uint32_t printed   = 0;
+		if (program.shader_hash == 0x723423f5115aedbdull && printed < 6) {
+			printed++;
+			last_hash = program.shader_hash;
+			const auto& fill = resources.uniform_fill;
+			std::printf("[Meta] fillshader: spec_reads=%zu fill.kind=%d words=%u value=0x%x stride0=%u res=%u "
+			            "mode=0x%x threads=%u,%u,%u dispatch_dims=%d groups=%u,%u,%u buffers=%zu\n",
+			            resources.specialization_reads.size(), static_cast<int>(fill.kind), fill.words,
+			            fill.value, fill.group_stride[0], static_cast<uint32_t>(fill.resource), mode,
+			            input_info.threads_num[0], input_info.threads_num[1], input_info.threads_num[2],
+			            input_info.dispatch_thread_dimensions ? 1 : 0, thread_group_x, thread_group_y,
+			            thread_group_z, program.info.buffers.size());
+			for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+				const auto d = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				std::printf("[Meta]   buf%u written=%d read=%d stride=%u fmt=%u records=%u size=%llu swz=%d idx=%u tid=%d\n",
+				            i, program.info.buffers[i].written, program.info.buffers[i].read, d.Stride(),
+				            static_cast<uint32_t>(d.Format()), d.NumRecords(),
+				            static_cast<unsigned long long>(d.GetSize()), d.SwizzleEnabled() ? 1 : 0,
+				            d.IndexStride(), d.AddTid() ? 1 : 0);
+			}
+			(void)last_hash;
+		}
+	}
+	{
+	KYTY_PROFILER_BLOCK("Cmp::MetaClear");
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                 thread_group_z, mode))) {
 		ResetBindings();
 		return;
+	}
 	}
 
 	if (use_thread_dimensions) {
@@ -333,7 +384,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	{
+	KYTY_PROFILER_BLOCK("Cmp::EndRendering");
 	buffer.EndRendering();
+	}
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
@@ -344,11 +398,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
+	if (Diag::MetaEnabled() && program.bindings.memory_offset_count != 0) {
+		const uint32_t groups[3] {thread_group_x, thread_group_y, thread_group_z};
+		for (uint32_t i = 0; i < bindings.buffer_sources.size(); i++) {
+			const auto resource = program.bindings.descriptors.front().resources[i];
+			if (program.info.buffers[resource].written && bindings.buffer_sources[i].size != 0) {
+				Diag::RecordWrite(bindings.buffer_sources[i].address, bindings.buffer_sources[i].size,
+				                  program.shader_hash, groups, program.info.has_bitwise_xor);
+			}
+		}
+	}
 	if (program.info.uses_dma) {
+		KYTY_PROFILER_BLOCK("Cmp::PrepareBda");
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
+	{
+	KYTY_PROFILER_BLOCK("Cmp::SharedMem");
 	BindSharedMemory(m_context, input_info, bindings);
+	}
 	RebindBuffers(bindings);
 
 	auto              vk_buffer        = buffer.Handle();
@@ -365,6 +433,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                }) ||
 	    has_storage_writes;
 	if (has_storage_writes) {
+		KYTY_PROFILER_BLOCK("Cmp::HazardBarrier");
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -429,11 +498,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	{
+	KYTY_PROFILER_BLOCK("Cmp::Emit");
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 
+	{
+	KYTY_PROFILER_BLOCK("Cmp::AccessBarrier");
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
 }
 

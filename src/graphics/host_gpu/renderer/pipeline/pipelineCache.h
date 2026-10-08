@@ -4,9 +4,11 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/pipeline/asyncMaterialize.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 
 #include <cstddef>
 #include <filesystem>
@@ -121,6 +123,72 @@ public:
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
 
+	// Everything GetGraphicsPrograms derives from register state before touching the program
+	// cache. Splitting the two lets the (expensive) resource materialization run on a worker.
+	struct GraphicsPrepared {
+		std::array<ShaderParams, 3> vertex_params;
+		ShaderParams                pixel_params;
+		bool                        tess_active  = false;
+		bool                        mesh_active  = false;
+		bool                        pixel_active = false;
+	};
+
+	// Asynchronous materializations submitted for one draw. Tasks stay owned by the draw until
+	// ReleaseGraphicsAsync(); the resource snapshots they produce are referenced by the shader
+	// stages of that draw.
+	struct AsyncGraphics {
+		struct Stage {
+			void*            entry = nullptr;
+			MaterializeTask* task  = nullptr;
+			bool             valid = false;
+		};
+		Stage vertex;
+		Stage pixel;
+	};
+
+	GraphicsPrepared
+	PrepareGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
+	                        const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+	                        const HW::Context& context, const HW::UserConfig& user_config,
+	                        std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                        bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
+	                        ShaderPixelInputInfo& pixel_info);
+	GraphicsPrograms ResolveGraphicsPrograms(const GraphicsPrepared&                  prepared,
+	                                         std::array<ShaderVertexInputInfo, 3>& vertex_info,
+	                                         ShaderPixelInputInfo&                 pixel_info);
+	// Returns true when asynchronous materialization is available for this prepared draw
+	// (single plain vertex stage); submits a task for every stage whose program is cached.
+	bool SubmitGraphicsAsync(const GraphicsPrepared&                        prepared,
+	                         const std::array<ShaderVertexInputInfo, 3>&    vertex_info,
+	                         const ShaderPixelInputInfo& pixel_info, uint64_t dirty_epoch,
+	                         AsyncGraphics& async);
+	// Uses the completed (and validated) tasks, falling back to synchronous materialization
+	// for any stage whose result is unusable.
+	GraphicsPrograms ResolveGraphicsProgramsAsync(const GraphicsPrepared&            prepared,
+	                                              const AsyncGraphics&               async,
+	                                              std::array<ShaderVertexInputInfo, 3>& vertex_info,
+	                                              ShaderPixelInputInfo&              pixel_info);
+	void             ReleaseGraphicsAsync(AsyncGraphics& async);
+
+	// Compute counterparts of the draw preparation above.
+	ShaderParams PrepareComputeProgram(const HW::ComputeShaderInfo& regs,
+	                                   const HW::ShaderRegisters&   sh,
+	                                   ShaderComputeInputInfo&      input_info);
+	AsyncGraphics::Stage SubmitComputeAsync(const ShaderParams&           params,
+	                                        const ShaderComputeInputInfo& input_info,
+	                                        uint64_t                      dirty_epoch);
+	ShaderProgram ResolveComputeProgramAsync(const ShaderParams&      params,
+	                                         ShaderComputeInputInfo&  input_info,
+	                                         const AsyncGraphics::Stage& stage);
+	void          ReleaseAsyncStage(AsyncGraphics::Stage& stage);
+	[[nodiscard]] bool AsyncEnabled() const { return m_async != nullptr; }
+	// Blocks until the worker has finished every submitted task.
+	void WaitAsyncIdle() {
+		if (m_async != nullptr) {
+			m_async->WaitIdle();
+		}
+	}
+
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
 	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
@@ -170,6 +238,7 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	std::unique_ptr<AsyncMaterializer> m_async;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;

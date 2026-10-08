@@ -1,5 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -97,6 +100,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
+		m_buffers_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
@@ -110,6 +114,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
 		m_buffers.erase(found);
+		m_buffers_generation.fetch_add(1, std::memory_order_acq_rel);
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
@@ -152,6 +157,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    m_gpu_dirty_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
 	    });
 	if (copies.empty()) {
 		return false;
@@ -245,8 +251,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto        budget =
 	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
 	const auto threshold = std::min(budget, target_threshold);
-	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
-	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
+	// Keep roughly 3 * threshold / 10 free (2.4 GiB on large GPUs) before collecting; the old
+	// 6 * threshold / 10 made 16 GiB cards evict and recreate buffers constantly at 10 GiB.
+	// The original, eager thresholds are the default: relaxing them (KYTY_GC_NEW=1) kept the texture
+	// cache from evicting on 16 GiB cards, which made stale textures flash on screen during fights.
+	const char* gc_new   = std::getenv("KYTY_GC_NEW");
+	const bool  old_gc   = gc_new == nullptr || gc_new[0] != '1';
+	const auto expected  = std::min(budget - (old_gc ? 6 : 3) * threshold / 10, budget - GiB);
+	const auto critical  = std::min(budget - (old_gc ? 2 : 1) * threshold / 10, budget - GiB / 2);
 	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
 }
@@ -274,6 +286,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	KYTY_PROFILER_BLOCK("Buf::ReadMemory");
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -619,6 +632,17 @@ void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	static const bool gc_log = [] {
+		const char* env = std::getenv("KYTY_GC_LOG");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (gc_log && tick % 300 == 0) {
+		std::printf("[GC] buffers: used=%.2f GiB trigger=%.2f GiB critical=%.2f GiB budget=%.2f GiB\n",
+		            static_cast<double>(m_total_used_memory) / (1ull << 30),
+		            static_cast<double>(m_trigger_gc_memory) / (1ull << 30),
+		            static_cast<double>(m_critical_gc_memory) / (1ull << 30),
+		            static_cast<double>(m_graphics.GetTotalMemoryBudget()) / (1ull << 30));
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

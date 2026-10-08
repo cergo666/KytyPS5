@@ -56,6 +56,16 @@ public:
 		}
 	}
 
+	// Lowest start and highest end of all ranges; false when the set is empty.
+	[[nodiscard]] bool Bounds(uint64_t& low, uint64_t& high) const {
+		if (m_ranges.empty()) {
+			return false;
+		}
+		low  = m_ranges.begin()->first;
+		high = m_ranges.rbegin()->second;
+		return true;
+	}
+
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);

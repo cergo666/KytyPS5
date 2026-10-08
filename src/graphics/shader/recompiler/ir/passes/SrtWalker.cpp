@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -179,12 +180,33 @@ private:
 		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
 		// Integer-only dependency checks do not depend on the active EXEC mask.
 		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
+		// A successful uniform validation depends only on the node and the current active mask.
+		// Shared subexpressions are otherwise re-validated once per path, which grows
+		// exponentially with the depth of reconvergent value graphs.
+		UniformKey uniform_key {inst, nullptr};
+		bool       memoizable = false;
+		if (require_uniform) {
+			if (m_active_mask.IsEmpty()) {
+				memoizable = true;
+			} else if (const auto* mask_inst = m_active_mask.TryInstruction()) {
+				uniform_key.mask = mask_inst;
+				memoizable       = true;
+			}
+			if (memoizable && m_validated_uniform.contains(uniform_key)) return true;
+		}
 		if (!m_visiting.insert(inst).second) {
+			++m_cycle_hits;
 			return !require_uniform;
 		}
-		const auto finish = [&](bool valid) {
+		const auto cycle_hits_before = m_cycle_hits;
+		const auto finish            = [&](bool valid) {
 			m_visiting.erase(inst);
 			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+			// Only cache results that did not lean on a cycle assumption: those would be
+			// context dependent.
+			if (valid && memoizable && m_cycle_hits == cycle_hits_before) {
+				m_validated_uniform.insert(uniform_key);
+			}
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -318,6 +340,16 @@ private:
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
+
+	struct UniformKey {
+		const Inst* inst;
+		const Inst* mask;
+		bool        operator<(const UniformKey& other) const {
+			return inst != other.inst ? inst < other.inst : mask < other.mask;
+		}
+	};
+	std::set<UniformKey> m_validated_uniform;
+	uint64_t             m_cycle_hits = 0;
 };
 
 

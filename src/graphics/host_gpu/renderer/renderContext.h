@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -82,6 +83,12 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	std::atomic_uint64_t      m_mapped_generation {0};
+	// Generations observed by the last full BDA synchronization pass.
+	uint64_t                  m_bda_synced_cpu_dirty = 0;
+	uint64_t                  m_bda_synced_buffers   = 0;
+	uint64_t                  m_bda_synced_mapped    = 0;
+	bool                      m_bda_synced_valid     = false;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

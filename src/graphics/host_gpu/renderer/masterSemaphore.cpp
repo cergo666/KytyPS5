@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <cstdio>
+
 namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
@@ -50,6 +52,12 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (result != vk::Result::eSuccess) {
+		std::printf("vkWaitSemaphores failed: %s (%d), tick=%llu\n", vk::to_string(result).c_str(),
+		            static_cast<int>(result), static_cast<unsigned long long>(tick));
+		std::fflush(stdout);
+		m_graphics.LogMemoryBudget();
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

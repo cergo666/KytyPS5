@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -65,6 +67,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		KYTY_PROFILER_BLOCK("Ctx::FaultRead");
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -90,6 +93,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_mapped_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -113,6 +117,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_mapped_generation.fetch_add(1, std::memory_order_acq_rel);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -124,15 +129,33 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	KYTY_PROFILER_BLOCK("Draw::PrepareBda");
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// Synchronizing every mapped buffer only matters when guest writes, buffer creation or
+	// mapping changes happened since the previous pass. Generations are sampled before the scan
+	// so concurrent changes are picked up by the next call.
+	const auto cpu_dirty = RegionManager::CpuDirtyGeneration();
+	const auto buffers   = m_buffer_cache.BuffersGeneration();
+	const auto mapped    = m_mapped_generation.load(std::memory_order_acquire);
 	m_fault_process_pending = true;
+	if (m_bda_synced_valid && m_bda_synced_cpu_dirty == cpu_dirty && m_bda_synced_buffers == buffers &&
+	    m_bda_synced_mapped == mapped) {
+		return;
+	}
+	{
+		KYTY_PROFILER_BLOCK("Draw::PrepareBda(scan)");
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+	}
+	m_bda_synced_cpu_dirty = cpu_dirty;
+	m_bda_synced_buffers   = buffers;
+	m_bda_synced_mapped    = mapped;
+	m_bda_synced_valid     = true;
 }
 
 void RenderContext::RunGarbageCollector() {

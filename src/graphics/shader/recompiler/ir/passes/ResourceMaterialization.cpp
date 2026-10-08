@@ -183,15 +183,14 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
 	}
 	if (!extra.IsEmpty()) pending.push_back(extra);
-	std::vector<const Inst*> visited;
+	std::unordered_set<const Inst*> visited;
 	while (!pending.empty()) {
 		auto value = pending.back().Resolve();
 		pending.pop_back();
 		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+		if (inst == nullptr || !visited.insert(inst).second) {
 			continue;
 		}
-		visited.push_back(inst);
 		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
 			const auto slot = inst->Arg(1).Resolve();
 			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < slots.size()) {
@@ -1001,7 +1000,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
 	Value unknown;
-	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
+	// Branch predicates form DAGs with shared sub-predicates; without a memo each shared node
+	// is re-cloned and re-validated once per path, which is exponential in the DAG depth.
+	std::function<Value(Value)> ClonePredicate;
+	std::unordered_map<const Inst*, Value> predicate_memo;
+	std::function<Value(Value)> ClonePredicateUncached = [&](Value value) -> Value {
 		value = value.Resolve();
 		if (value.IsEmpty()) return {};
 		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) return Clone(value);
@@ -1028,6 +1031,18 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		node.SetArg(0, left);
 		node.SetArg(1, right);
 		return Value(&node);
+	};
+	ClonePredicate = [&](Value value) -> Value {
+		value = value.Resolve();
+		const auto* key = value.TryInstruction();
+		if (key != nullptr) {
+			if (const auto found = predicate_memo.find(key); found != predicate_memo.end()) {
+				return found->second;
+			}
+		}
+		const auto result = ClonePredicateUncached(value);
+		if (key != nullptr) predicate_memo.emplace(key, result);
+		return result;
 	};
 	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
 	plan.uniform_fill = AnalyzeUniformFill(program);
