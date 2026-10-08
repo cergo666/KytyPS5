@@ -40,6 +40,7 @@ public:
 		VmaAllocator  allocator;
 		VkImage       image;
 		VmaAllocation allocation;
+		VkBuffer      buffer = VK_NULL_HANDLE; // set: a buffer, otherwise an image
 	};
 
 	ImageDestroyer(): m_thread([this] { Run(); }) {}
@@ -68,7 +69,11 @@ private:
 				m_queue.pop_front();
 				m_busy = true;
 				lock.unlock();
-				vmaDestroyImage(item.allocator, item.image, item.allocation);
+				if (item.buffer != VK_NULL_HANDLE) {
+					vmaDestroyBuffer(item.allocator, item.buffer, item.allocation);
+				} else {
+					vmaDestroyImage(item.allocator, item.image, item.allocation);
+				}
 				lock.lock();
 				m_busy = false;
 			}
@@ -233,6 +238,17 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.subresource_states.clear();
 
 	return true;
+}
+
+void GraphicContext::DeleteBufferAsync(VkBuffer buffer, VmaAllocation allocation) {
+	if (allocator == nullptr) {
+		return; // the allocator is gone; its memory was released with it
+	}
+	GetImageDestroyer().Push({allocator, VK_NULL_HANDLE, allocation, buffer});
+}
+
+void GraphicContext::DrainDeferredDestruction() {
+	GetImageDestroyer().Drain();
 }
 
 void GraphicContext::DeleteImage(VulkanImage& image) {
