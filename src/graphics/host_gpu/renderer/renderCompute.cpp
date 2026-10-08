@@ -4,6 +4,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/renderer/renderCheckpoint.h"
 #include "graphics/host_gpu/renderer/renderDeferred.h"
 #include "graphics/host_gpu/renderer/renderDiag.h"
 #include "common/stringUtils.h"
@@ -501,6 +502,8 @@ void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffe
 	{
 	KYTY_PROFILER_BLOCK("Cmp::Emit");
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	Checkpoint::Mark(vk_buffer, 2, submit_id, program.shader_hash, 0, thread_group_x, thread_group_y,
+	                 thread_group_z);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 

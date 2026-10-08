@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/renderCheckpoint.h"
 
 #include <cstdio>
 
@@ -28,6 +29,12 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+	if (result != vk::Result::eSuccess) {
+		std::printf("vkGetSemaphoreCounterValue failed: %s (%d)\n", vk::to_string(result).c_str(),
+		            static_cast<int>(result));
+		std::fflush(stdout);
+		Checkpoint::Dump();
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
@@ -57,6 +64,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		            static_cast<int>(result), static_cast<unsigned long long>(tick));
 		std::fflush(stdout);
 		m_graphics.LogMemoryBudget();
+		Checkpoint::Dump(m_graphics.queue);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();

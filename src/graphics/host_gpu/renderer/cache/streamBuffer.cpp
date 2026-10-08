@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -67,8 +68,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// BDA buffers used to get one dedicated device allocation each (a kernel call to create and
+	// another to free). They now come out of VMA's shared blocks; KYTY_BDA_DEDICATED=1 restores
+	// the dedicated allocations.
+	static const bool dedicated_bda = [] {
+		const char* env = std::getenv("KYTY_BDA_DEDICATED");
+		return env != nullptr && env[0] == '1';
+	}();
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && dedicated_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
@@ -79,9 +87,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	auto              result        = static_cast<vk::Result>(vmaCreateBuffer(
+        graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+        &native_buffer, &m_allocation, &allocation_result));
+	if (result != vk::Result::eSuccess) {
+		// Memory still queued for release on the helper thread may be what is missing.
+		graphics.DrainDeferredDestruction();
+		native_buffer = VK_NULL_HANDLE;
+		result        = static_cast<vk::Result>(vmaCreateBuffer(
+            graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+            &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
 	}
@@ -106,7 +122,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		// Owners destroy buffers only after the GPU is done with them (deferred operations).
+		m_graphics->DeleteBufferAsync(m_buffer, m_allocation);
 	}
 }
 

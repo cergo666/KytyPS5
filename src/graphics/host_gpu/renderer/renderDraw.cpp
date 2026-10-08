@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderCheckpoint.h"
 #include "graphics/host_gpu/renderer/renderDeferred.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -1281,8 +1282,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (gpu_args_addr != 0) {
+		Checkpoint::Mark(vk_buffer, 1, submit_id, state.vertex_info[0].stage.program->shader_hash,
+		                 state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0, 0, 0,
+		                 0, gpu_args_addr);
 		vk_buffer.drawIndirect(args_buffer, args_offset, 1, 16);
 	} else {
+		Checkpoint::Mark(vk_buffer, 0, submit_id, state.vertex_info[0].stage.program->shader_hash,
+		                 state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+		                 draw.index_count, draw.instance_count, emit.first_instance);
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 

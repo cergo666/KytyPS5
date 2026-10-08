@@ -100,6 +100,11 @@ struct GraphicContext {
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	// Frees a buffer's memory on a helper thread (it is a dedicated allocation and costs tens of
+	// microseconds). Call only once the GPU has finished with the buffer. Waits for the helper when
+	// `drain` is set, e.g. after an out-of-memory failure.
+	void                   DeleteBufferAsync(VkBuffer buffer, VmaAllocation allocation);
+	void                   DrainDeferredDestruction();
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;

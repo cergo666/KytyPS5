@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cstdio>
 #include <deque>
@@ -520,7 +521,51 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		static const bool queue_stats = [] {
+			const char* env = std::getenv("KYTY_DIAG_META");
+			return env != nullptr && env[0] == '1';
+		}();
+		const bool complete = [&] {
+			if (!queue_stats) {
+				return gpu->Process(submission);
+			}
+			// Diagnostic: how the command processor's time splits between the guest's queues.
+			struct QueueStat {
+				double   seconds = 0;
+				uint64_t slices = 0, submissions = 0, dwords = 0;
+			};
+			static std::array<QueueStat, QueueCount> stats;
+			static auto window_start = std::chrono::steady_clock::now();
+			const bool  first        = !submission.started;
+			const auto  dwords       = submission.commands.size() + submission.constant_commands.size();
+			const auto  begin        = std::chrono::steady_clock::now();
+			const bool  done         = gpu->Process(submission);
+			const auto  end          = std::chrono::steady_clock::now();
+			auto&       stat         = stats[submission.queue_id];
+			stat.seconds += std::chrono::duration<double>(end - begin).count();
+			stat.slices++;
+			if (first) {
+				stat.submissions++;
+				stat.dwords += dwords;
+			}
+			const double window = std::chrono::duration<double>(end - window_start).count();
+			if (window >= 5.0) {
+				std::printf("[Queues] %.1fs window:", window);
+				for (uint32_t q = 0; q < QueueCount; q++) {
+					if (stats[q].slices == 0) continue;
+					std::printf(" q%u(%s) busy=%.0f%% subs=%llu slices=%llu dw=%llu |", q,
+					            q == 0 ? "gfx" : "compute", 100.0 * stats[q].seconds / window,
+					            static_cast<unsigned long long>(stats[q].submissions),
+					            static_cast<unsigned long long>(stats[q].slices),
+					            static_cast<unsigned long long>(stats[q].dwords));
+					stats[q] = {};
+				}
+				std::printf("\n");
+				std::fflush(stdout);
+				window_start = end;
+			}
+			return done;
+		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
