@@ -140,12 +140,46 @@ private:
 		}
 	}
 
+	// Base name of the module containing pc ("kyty_emulator.exe", "nvoglv64.dll", ...).
+	const std::string& ModuleOf(uint64_t pc) {
+		const auto base = SymGetModuleBase64(GetCurrentProcess(), pc);
+		auto       it   = m_modules.find(base);
+		if (it != m_modules.end()) {
+			return it->second;
+		}
+		char path[MAX_PATH] = "?";
+		if (base == 0 || GetModuleFileNameA(reinterpret_cast<HMODULE>(base), path, MAX_PATH) == 0) {
+			std::snprintf(path, sizeof(path), "?");
+		}
+		const char* file = std::strrchr(path, '\\');
+		return m_modules.emplace(base, file != nullptr ? file + 1 : path).first->second;
+	}
+
 	void Report() {
 		if (m_samples.empty()) {
 			return;
 		}
 		std::unordered_map<std::string, uint32_t> leaf_function, leaf_line, inclusive;
+		// Time outside the emulator, keyed by the module the emulator called into and the emulator
+		// function that made the call (for example "nvoglv64.dll <- CommitBindings").
+		std::unordered_map<std::string, uint32_t> external_by_caller, leaf_module;
+		static const std::string self_module = [] {
+			char path[MAX_PATH] = "?";
+			GetModuleFileNameA(nullptr, path, MAX_PATH);
+			const char* file = std::strrchr(path, '\\');
+			return std::string(file != nullptr ? file + 1 : path);
+		}();
 		for (const auto& sample: m_samples) {
+			leaf_module[ModuleOf(sample.pc[0])]++;
+			if (ModuleOf(sample.pc[0]) != self_module) {
+				for (uint32_t i = 1; i < sample.depth; ++i) {
+					if (ModuleOf(sample.pc[i]) == self_module) {
+						external_by_caller[ModuleOf(sample.pc[i - 1]) + " <- " +
+						                   Resolve(sample.pc[i]).function]++;
+						break;
+					}
+				}
+			}
 			leaf_function[Resolve(sample.pc[0]).function]++;
 			leaf_line[Resolve(sample.pc[0]).line]++;
 			std::unordered_set<std::string> seen;
@@ -166,6 +200,8 @@ private:
 			std::vector<std::pair<std::string, uint32_t>> rows(map.begin(), map.end());
 			Print(out, title, rows, m_samples.size(), limit);
 		};
+		dump("time by leaf module", leaf_module, 20);
+		dump("time outside the emulator: entered module <- emulator caller", external_by_caller, 60);
 		dump("inclusive (function appears anywhere in the stack)", inclusive, 80);
 		dump("self time by function", leaf_function, 60);
 		dump("self time by source line", leaf_line, 80);
@@ -176,6 +212,7 @@ private:
 	double                                m_window_seconds;
 	std::vector<Sample>                   m_samples;
 	std::unordered_map<uint64_t, SymbolInfo> m_cache;
+	std::unordered_map<uint64_t, std::string> m_modules;
 	uint32_t                              m_report_index = 0;
 };
 

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -211,11 +212,17 @@ private:
 	}
 
 	static void Run(Lane& lane, std::stop_token stop) {
+		// Spin iterations before a lane sleeps (KYTY_ASYNC_SPIN). Longer spinning was measured to burn
+		// CPU without making frames faster.
+		static const uint32_t spin_limit = [] {
+			const char* env = std::getenv("KYTY_ASYNC_SPIN");
+			return env != nullptr ? static_cast<uint32_t>(std::atoi(env)) : 20000u;
+		}();
 		uint64_t tail  = 0;
 		uint32_t spins = 0;
 		while (!stop.stop_requested()) {
 			if (tail == lane.head.load(std::memory_order_acquire)) {
-				if (++spins < 20000) {
+				if (++spins < spin_limit) {
 #if defined(_MSC_VER) || defined(__clang__)
 					_mm_pause();
 #endif

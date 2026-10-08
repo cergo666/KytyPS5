@@ -2,6 +2,7 @@
 #include <SDL3/SDL_vulkan.h>
 
 #include "common/assert.h"
+#include "graphics/host_gpu/vulkanRecorder.h"
 #include "graphics/host_gpu/renderer/renderCheckpoint.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -1034,6 +1035,7 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	Checkpoint::g_queue = graphic_ctx.queue;
+	VkRecorder::Install(graphic_ctx);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

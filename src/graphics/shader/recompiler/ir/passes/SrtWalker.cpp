@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -362,7 +363,18 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
       m_context(AcquireContext(program)) {}
 
-SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
+EvaluationScratch& ThreadEvaluationScratch() {
+	static thread_local EvaluationScratch scratch;
+	return scratch;
+}
+
+void AssignEvaluationIndices(ResourcePlan& plan) {
+	for (auto& inst: plan.value_storage) {
+		(void)inst.EvaluationIndex(plan.evaluation_value_count);
+	}
+}
+
+SrtWalker::~SrtWalker() { --ThreadEvaluationScratch().depth; }
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	uint64_t wide = 0;
@@ -374,10 +386,11 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 }
 
 ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& program) {
-	if (program.evaluation_depth == program.evaluation_contexts.size()) {
-		program.evaluation_contexts.emplace_back();
+	auto& scratch = ThreadEvaluationScratch();
+	if (scratch.depth == scratch.contexts.size()) {
+		scratch.contexts.emplace_back();
 	}
-	auto& context = program.evaluation_contexts[program.evaluation_depth++];
+	auto& context = scratch.contexts[scratch.depth++];
 	context.generation += 2;
 	return context;
 }
@@ -413,7 +426,8 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	}
 	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
 	if (index >= m_context.values.size()) {
-		m_context.values.resize(m_program.evaluation_value_count);
+		const auto count = std::atomic_ref<uint32_t>(m_program.evaluation_value_count).load(std::memory_order_acquire);
+		m_context.values.resize(std::max<size_t>(index + 1u, count));
 	}
 	if (m_context.values[index].generation == m_context.generation) {
 		result = m_context.values[index].value;
@@ -973,7 +987,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
 	};
-	auto& active = m_program.active_sources;
+	auto& active = ThreadEvaluationScratch().active_sources;
 	if (m_program.control_flow.empty()) {
 		active.clear();
 		flat.resize(m_program.srt_reads.size());
@@ -987,8 +1001,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	for (const auto& block: m_program.control_flow) {
 		for (const auto source: block.sources) active.at(source) = 0u;
 	}
-	auto& visited = m_program.visited_blocks;
-	auto& pending = m_program.pending_blocks;
+	auto& visited = ThreadEvaluationScratch().visited_blocks;
+	auto& pending = ThreadEvaluationScratch().pending_blocks;
 	visited.assign(m_program.control_flow.size(), 0u);
 	pending.clear();
 	pending.push_back(0u);

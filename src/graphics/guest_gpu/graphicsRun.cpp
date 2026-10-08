@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/cpSampler.h"
 #include "graphics/perfLog.h"
+#include "graphics/host_gpu/vulkanRecorder.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -450,6 +451,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state  = gpu;
 	CpSamplerStartIfEnabled();
 	PerfLog::RegisterThisThread("cp");
+	VkRecorder::EnableForThisThread();
 	PerfLog::Start();
 
 	for (;;) {

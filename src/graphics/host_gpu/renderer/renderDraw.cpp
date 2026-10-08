@@ -23,6 +23,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderCheckpoint.h"
 #include "graphics/host_gpu/renderer/renderDeferred.h"
+#include "graphics/host_gpu/renderer/renderDrawStats.h"
+#include "graphics/perfLog.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -545,15 +547,27 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
-		auto layout = depth_attachment_layout(depth);
-		if (sampled_aspects & ~DepthReadableAspects(layout)) {
+		auto layout = image.backing.subresource_states.empty() ? image.backing.state.layout
+		                                                       : vk::ImageLayout::eUndefined;
+		if (!DepthAttachmentLayoutPermits(layout, draw_writes, sampled_aspects)) {
+			layout =
+			    depth_attachment_layout(ImageViewOps::DepthAspectMask(depth.desc.view_info.format),
+			                            draw_writes, sampled_aspects);
+		}
+		// A draw writing an aspect it also samples (possibly in another subresource) needs one
+		// layout for both.
+		if ((draw_writes & ~DepthWritableAspects(layout)) ||
+		    (sampled_aspects & ~DepthReadableAspects(layout))) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
-		// The attachment store writes even when guest depth/stencil tests do not.
-		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		// The attachment store writes even when guest depth/stencil tests do not. Sampled targets
+		// take their shader reads here too, so binding them needs no second barrier.
+		const auto access =
+		    vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		    vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+		    (sampled_aspects ? vk::AccessFlagBits2::eShaderRead : vk::AccessFlags2 {});
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;
@@ -1204,6 +1218,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	if (DrawStats::Enabled()) {
+		const auto extent = state.color_count != 0 ? state.color_info[0].Extent() : vk::Extent2D {0, 0};
+		DrawStats::RecordDraw(
+		    state.vertex_info[0].stage.program->shader_hash,
+		    state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+		    state.color_count != 0 ? state.color_info[0].desc.info.data.address : 0,
+		    state.depth_info.image_id ? state.depth_info.desc.info.data.address : 0, extent.width,
+		    extent.height, state.color_count, draw.index_count, draw.instance_count);
+	}
 	vk::Buffer args_buffer;
 	uint64_t   args_offset = 0;
 	if (gpu_args_addr != 0) {
@@ -1574,6 +1597,66 @@ bool RenderExecutor::HasDeferredDraws() const noexcept {
 	return m_deferred != nullptr && m_deferred->count != 0;
 }
 
+// Personal-build quality knobs for the shadow-map passes (depth-only, square target, no pixel shader),
+// which make up about half of a fight frame's draws:
+//   KYTY_SHADOW_OFF=1         never draw them
+//   KYTY_SHADOW_EVERY=N       draw them only on every Nth frame (the map keeps its previous contents)
+//   KYTY_SHADOW_MIN_PRIMS=T   skip draws with fewer than T primitives
+// The first two are decided once per run of consecutive shadow draws so a map is never half updated.
+static bool ShadowFilterSkips(const HW::Context& ctx, const HW::Shader& sh, uint32_t count,
+                              uint32_t instances) {
+	static const struct Config {
+		bool     off       = false;
+		uint32_t every     = 1;
+		uint32_t min_prims = 0;
+		bool     any       = false;
+	} config = [] {
+		Config c;
+		const auto get = [](const char* name) -> long {
+			const char* env = std::getenv(name);
+			return env != nullptr ? std::atol(env) : 0;
+		};
+		c.off       = get("KYTY_SHADOW_OFF") == 1;
+		c.every     = static_cast<uint32_t>(std::max(1L, get("KYTY_SHADOW_EVERY")));
+		c.min_prims = static_cast<uint32_t>(std::max(0L, get("KYTY_SHADOW_MIN_PRIMS")));
+		c.any       = c.off || c.every > 1 || c.min_prims > 0;
+		return c;
+	}();
+	if (!config.any) {
+		return false;
+	}
+	static bool     in_run      = false;
+	static bool     run_skipped = false;
+	static uint64_t skipped = 0, kept = 0;
+
+	const auto& depth = ctx.GetDepthRenderTarget();
+	const bool  ps_present = sh.GetPs().ps_regs.data_addr != 0;
+	const bool  depth_only =
+	    DrawColorOutputMask(ctx) == 0 && depth.z_write_base_addr != 0 && depth.size.valid &&
+	    !(ps_present && PixelShaderHasDepthOrCoverageSideEffects(ctx.GetShaderRegisters()));
+	const bool square_map = depth.size.x_max == depth.size.y_max && depth.size.x_max >= 1023;
+	if (!depth_only || !square_map) {
+		in_run = false;
+		return false;
+	}
+	if (!in_run) {
+		in_run      = true;
+		run_skipped = config.off || (config.every > 1 &&
+		                             PerfLog::FrameCount() % config.every != 0);
+	}
+	bool skip = run_skipped;
+	if (!skip && config.min_prims != 0 &&
+	    static_cast<uint64_t>(count) * instances / 3 < config.min_prims) {
+		skip = true;
+	}
+	(skip ? skipped : kept)++;
+	if (((skipped + kept) & 0x3ffffu) == 0) {
+		std::printf("[Shadow] kept=%llu skipped=%llu\n", static_cast<unsigned long long>(kept),
+		            static_cast<unsigned long long>(skipped));
+	}
+	return skip;
+}
+
 bool RenderExecutor::TryDeferDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                        const DrawIndexArgs& args) {
 	return TryDeferGraphics(submit_id, buffer, &args, nullptr);
@@ -1629,6 +1712,10 @@ bool RenderExecutor::TryDeferGraphics(uint64_t submit_id, CommandBuffer& buffer,
 		return false;
 	}
 
+	if (ShadowFilterSkips(ctx, sh, is_indexed ? indexed->index_count : automatic->vertex_count,
+	                      instances)) {
+		return true; // consumed without drawing
+	}
 	if (queue.count == DeferredDrawQueue::kCapacity) {
 		FlushDeferredDraws();
 	}

@@ -455,15 +455,22 @@ struct PipelineCache::ProgramCache {
 			return {};
 		}
 		task->plan = &entry->second.resource_plan;
-		// A plan's evaluation scratch is not shared-safe, so a plan always maps to the same lane;
-		// different plans spread over all lanes.
+		// Plans are immutable once built and evaluation scratch is per thread, so consecutive tasks are
+		// spread over all lanes even when they share a shader (shadow passes submit hundreds of draws
+		// of one shader in a row). KYTY_ASYNC_RR=0 restores one lane per shader.
 		static const size_t lanes_used = [] {
 			const char* env = std::getenv("KYTY_ASYNC_LANES");
 			const int   n   = env != nullptr ? std::atoi(env) : static_cast<int>(AsyncMaterializer::kLaneCount);
 			return static_cast<size_t>(std::clamp(n, 1, static_cast<int>(AsyncMaterializer::kLaneCount)));
 		}();
-		lane = static_cast<size_t>(
-		    (reinterpret_cast<uintptr_t>(task->plan) >> 4) * 0x9E3779B97F4A7C15ull >> 32u) % lanes_used;
+		static const bool round_robin = [] {
+			const char* env = std::getenv("KYTY_ASYNC_RR");
+			return env == nullptr || env[0] != '0';
+		}();
+		static size_t next_lane = 0;
+		lane = round_robin ? next_lane++ % lanes_used
+		                   : static_cast<size_t>((reinterpret_cast<uintptr_t>(task->plan) >> 4) *
+		                                         0x9E3779B97F4A7C15ull >> 32u) % lanes_used;
 		std::copy_n(params.user_data.begin(), params.user_data_count, task->user_data.begin());
 		task->user_data_count      = params.user_data_count;
 		task->shader_base          = params.Base();

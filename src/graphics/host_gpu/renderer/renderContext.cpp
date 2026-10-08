@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/vulkanRecorder.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -38,6 +39,9 @@ void RenderContext::ShutdownGpu() {
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {
+		// The guest GPU thread is gone; let its queued driver work finish before touching the
+		// command buffer from this thread.
+		VkRecorder::Drain();
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.Finish();
 		}
