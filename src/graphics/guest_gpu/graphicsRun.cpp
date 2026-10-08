@@ -1,4 +1,6 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/cpSampler.h"
+#include "graphics/perfLog.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -445,6 +447,9 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	CpSamplerStartIfEnabled();
+	PerfLog::RegisterThisThread("cp");
+	PerfLog::Start();
 
 	for (;;) {
 		Submission                   submission;
@@ -654,6 +659,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(*this, execution);
 
 	ProcessPm4(execution);
+	// Deferred draws belong to this processor's register state; finish them before another
+	// processor (or the submission bookkeeping) runs.
+	m_renderer.GetRenderExecutor().FlushDeferredDraws();
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -670,9 +678,39 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// Packets that only update register/draw state and cannot observe or change anything a deferred
+// (not yet executed) draw depends on. Everything else must wait for the deferred draws.
+static bool IsDeferSafePacket(cp_op_parser_func_t handler, uint32_t packet_header,
+                              const uint32_t* payload) {
+	if (handler == CpOpSetContextReg || handler == CpOpSetShaderReg ||
+	    handler == CpOpSetUconfigReg || handler == CpOpIndirectCxRegs ||
+	    handler == CpOpIndirectShRegs || handler == CpOpIndirectUcRegs ||
+	    handler == CpOpIndexType || handler == CpOpIndexBase || handler == CpOpIndexBufferSize ||
+	    handler == CpOpNumInstances || handler == CpOpSetBase || handler == CpOpDrawIndex ||
+	    handler == CpOpDrawIndexOffset || handler == CpOpDispatchDirect ||
+	    handler == CpOpDrawIndexAuto) {
+		return true;
+	}
+	if (handler == CpOpNop) {
+		const auto r = KYTY_PM4_R(packet_header & ~1u);
+		if (r == Pm4::R_ZERO) {
+			// Plain padding; the 0x6875xxxx form is a marker with side effects.
+			return (payload[0] & 0xffff0000u) != 0x68750000u;
+		}
+		return r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER;
+	}
+	return false;
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	auto& executor = m_renderer.GetRenderExecutor();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
+			if (g_gpu_state->HasPendingCommands()) {
+				// Queued renderer commands (for example memory unmaps) are ordered after every
+				// draw already decoded.
+				executor.FlushDeferredDraws();
+			}
 			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
@@ -731,6 +769,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+
+		if (executor.HasDeferredDraws() && (handler == nullptr || !IsDeferSafePacket(handler, packet_header, packet + 1))) {
+			executor.FlushDeferredDraws();
+		}
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -857,7 +899,13 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	auto& executor = m_renderer.GetRenderExecutor();
+	if (executor.TryDeferDrawIndex(m_submit_id, CurrentBuffer(), args)) {
+		return;
+	}
+	// The draw runs now, so every earlier deferred draw must execute first.
+	executor.FlushDeferredDraws();
+	executor.DrawIndex(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -919,6 +967,23 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
 
+	{
+		static const bool diag = [] {
+			const char* env = std::getenv("KYTY_DIAG_META");
+			return env != nullptr && env[0] == '1';
+		}();
+		static uint32_t reports = 0;
+		if (diag && reports++ < 80) {
+			std::printf("[Indirect] indexed=%d count=%u max=%u count_addr=%d stride=%u regs(v=%u i=%u idx=%u) "
+			            "data_offset=0x%x args_base=0x%llx index_buf_size=%u instances=%u\n",
+			            indexed ? 1 : 0, draw_count, max_count_or_count, count_addr != nullptr ? 1 : 0,
+			            stride_in_bytes, registers.vertex_offset, registers.instance_offset,
+			            registers.index_offset, data_offset,
+			            static_cast<unsigned long long>(m_draw_indirect_args_base_addr), m_index_buffer_size,
+			            m_num_instances);
+		}
+	}
+
 	uint64_t index_size = 0;
 	if (indexed) {
 		switch (m_index_type_and_size) {
@@ -926,6 +991,27 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			case 1: index_size = 4; break;
 			case 2: index_size = 1; break;
 			default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
+		}
+	}
+
+	// A single non-indexed draw whose arguments the GPU may still be producing, with no per-draw
+	// register patching, is drawn with vkCmdDrawIndirect so the host never has to wait for them.
+	static const bool gpu_indirect_enabled = [] {
+		const char* env = std::getenv("KYTY_NO_GPU_INDIRECT");
+		return env == nullptr || env[0] != '1';
+	}();
+	if (gpu_indirect_enabled && !indexed && draw_count == 1 && count_addr == nullptr &&
+	    registers.vertex_offset == Pm4::SH_NOP && registers.instance_offset == Pm4::SH_NOP &&
+	    registers.index_offset == Pm4::SH_NOP && !GraphicsRunDebugDumpEnabled()) {
+		const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+		if ((args_addr & 3u) == 0) {
+			auto& executor = m_renderer.GetRenderExecutor();
+			// The draw runs now, so every earlier deferred draw must execute first.
+			executor.FlushDeferredDraws();
+			executor.DrawAuto(m_submit_id, CurrentBuffer(),
+			                  {.offset_source = DrawOffsetSource::IndirectArgs,
+			                   .gpu_args_addr = args_addr});
+			return;
 		}
 	}
 
@@ -1002,8 +1088,15 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                              thread_group_y, thread_group_z, mode);
+		auto& executor = m_renderer.GetRenderExecutor();
+		if (executor.TryDeferDispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+		                                    thread_group_y, thread_group_z, mode)) {
+			return;
+		}
+		// Runs now, so every earlier deferred operation must execute first.
+		executor.FlushDeferredDraws();
+		executor.DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x, thread_group_y,
+		                        thread_group_z, mode);
 	}
 }
 
@@ -1022,7 +1115,13 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}
-	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	auto& executor = m_renderer.GetRenderExecutor();
+	if (executor.TryDeferDrawAuto(m_submit_id, CurrentBuffer(), args)) {
+		return;
+	}
+	// The draw runs now, so every earlier deferred operation must execute first.
+	executor.FlushDeferredDraws();
+	executor.DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -208,14 +209,26 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	KYTY_PROFILER_BLOCK("Sched::PopPending");
+	// Reading the timeline semaphore is a driver call, and this runs before every draw and
+	// dispatch. Completed work only releases deferred resources, so look at the semaphore when the
+	// cached value does not already cover the oldest operation, and then only every few calls.
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
 				return;
+			}
+			if (!m_master.IsFree(m_pending_operations.front().tick)) {
+				if (++m_refresh_skip < 32) {
+					return;
+				}
+				m_refresh_skip = 0;
+				m_master.Refresh();
+				if (!m_master.IsFree(m_pending_operations.front().tick)) {
+					return;
+				}
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();

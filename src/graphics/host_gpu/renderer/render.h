@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -31,6 +32,8 @@ struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
+struct DeferredDraw;
+struct DeferredDrawQueue;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -72,6 +75,9 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Non-zero: the draw's arguments (a 16-byte DrawIndirectArgs) live in guest memory that the GPU
+	// may still be writing. The host draw reads them on the GPU and the counts above are unused.
+	uint64_t         gpu_args_addr              = 0;
 };
 
 struct SubmitInfo {
@@ -120,6 +126,25 @@ public:
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
 
+	// Temporarily points this buffer at another copy of the register state (used to run a
+	// deferred draw against the state captured when it was recorded).
+	struct StateBinding {
+		HW::Context*    registers   = nullptr;
+		HW::UserConfig* user_config = nullptr;
+		HW::Shader*     shaders     = nullptr;
+	};
+	StateBinding SwapState(HW::Context& registers, HW::UserConfig& user_config,
+	                       HW::Shader& shaders) noexcept {
+		StateBinding previous {m_registers, m_user_config, m_shaders};
+		Bind(registers, user_config, shaders);
+		return previous;
+	}
+	void RestoreState(const StateBinding& binding) noexcept {
+		m_registers   = binding.registers;
+		m_user_config = binding.user_config;
+		m_shaders     = binding.shaders;
+	}
+
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
@@ -152,8 +177,22 @@ private:
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
+
+	// Draw preparation can run ahead on a worker: eligible indexed draws are captured here
+	// together with their register state and executed, in order, by FlushDeferredDraws().
+	// Every other command-processor operation must flush first.
+	[[nodiscard]] bool TryDeferDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+	                                     const DrawIndexArgs& args);
+	[[nodiscard]] bool TryDeferDrawAuto(uint64_t submit_id, CommandBuffer& buffer,
+	                                    const DrawAutoArgs& args);
+	[[nodiscard]] bool TryDeferDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+	                                          uint32_t thread_group_x, uint32_t thread_group_y,
+	                                          uint32_t thread_group_z, uint32_t mode);
+	void               FlushDeferredDraws();
+	[[nodiscard]] bool HasDeferredDraws() const noexcept;
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
@@ -169,8 +208,17 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	void DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	                        uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                        DeferredDraw* deferred);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	void DrawIndexImpl(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
+	                   DeferredDraw* deferred);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	void DrawAutoImpl(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args,
+	                  DeferredDraw* deferred);
+	[[nodiscard]] bool TryDeferGraphics(uint64_t submit_id, CommandBuffer& buffer,
+	                                    const DrawIndexArgs* indexed, const DrawAutoArgs* automatic);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -189,11 +237,12 @@ private:
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
-	                                          DrawRenderState& state);
+	                                          DrawRenderState& state,
+	                                          DeferredDraw* deferred = nullptr);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable);
+	                         bool primitive_restart_enable, uint64_t gpu_args_addr = 0);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -217,6 +266,8 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	std::unique_ptr<DeferredDrawQueue>    m_deferred;
+	uint32_t                              m_ops_since_submit = 0;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -1,10 +1,14 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/renderer/renderDiag.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -155,11 +159,20 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		const auto        budget =
 		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
 		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		// Keep roughly 3 * threshold / 10 free (2.4 GiB on large GPUs) before evicting; the old
+		// 6 * threshold / 10 and a (budget - threshold) / 2 start made 16 GiB cards evict and
+		// recreate images constantly at 10 GiB of use.
+		// The original, eager thresholds are the default: relaxing them (KYTY_GC_NEW=1) kept the
+		// cache from evicting on 16 GiB cards, which made stale textures flash during fights.
+		const char* gc_new = std::getenv("KYTY_GC_NEW");
+		const bool  old_gc = gc_new == nullptr || gc_new[0] != '1';
+		const auto pressure = std::max<int64_t>(
+		    std::min(budget - (old_gc ? 6 : 3) * threshold / 10, budget - GiB), GiB + GiB / 2);
+		m_pressure_gc_memory = static_cast<uint64_t>(pressure);
+		m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
+		    std::min(budget - (old_gc ? 2 : 1) * threshold / 10, budget - GiB / 2), 3 * GiB));
+		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>(
+		    (budget - threshold) / 2, old_gc ? 0 : pressure - GiB / 2));
 	}
 }
 
@@ -1167,6 +1180,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		KYTY_PROFILER_BLOCK("Tex::MetaReadback");
+		if (Diag::MetaEnabled()) {
+			Diag::ReportMetaReadback(range.address, range.size);
+		}
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
@@ -1994,6 +2011,17 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	static const bool gc_log = [] {
+		const char* env = std::getenv("KYTY_GC_LOG");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (gc_log && tick % 300 == 0) {
+		std::printf("[GC] textures: used=%.2f GiB trigger=%.2f pressure=%.2f critical=%.2f GiB\n",
+		            static_cast<double>(m_total_used_memory) / (1ull << 30),
+		            static_cast<double>(m_trigger_gc_memory) / (1ull << 30),
+		            static_cast<double>(m_pressure_gc_memory) / (1ull << 30),
+		            static_cast<double>(m_critical_gc_memory) / (1ull << 30));
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

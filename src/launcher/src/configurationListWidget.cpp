@@ -715,6 +715,14 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		}
 
 		scan_archives(root, root);
+
+		// The configured folder may itself be a game directory.
+		if (root.exists(eboot_name)) {
+			add_game(root.absolutePath(), NormalizeGameDirectory(root.absolutePath()),
+			         root.relativeFilePath(root.absolutePath()), root.dirName(), false);
+			continue;
+		}
+
 		QList<QDir> pending_dirs;
 		const auto  root_subdirs =
 		    root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);

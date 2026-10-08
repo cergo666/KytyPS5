@@ -21,8 +21,75 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// vmaDestroyImage costs tens of microseconds (it frees a dedicated device allocation) and used to
+// run on the command processor thread inside deferred-operation processing. Images reach it only
+// after the GPU has finished with them, so the actual release can happen on a helper thread.
+// VMA allocators are internally synchronized.
+class ImageDestroyer {
+public:
+	struct Item {
+		VmaAllocator  allocator;
+		VkImage       image;
+		VmaAllocation allocation;
+	};
+
+	ImageDestroyer(): m_thread([this] { Run(); }) {}
+
+	void Push(const Item& item) {
+		{
+			std::lock_guard lock(m_mutex);
+			m_queue.push_back(item);
+		}
+		m_wake.notify_one();
+	}
+
+	// Waits until every queued image has been destroyed.
+	void Drain() {
+		std::unique_lock lock(m_mutex);
+		m_idle.wait(lock, [this] { return m_queue.empty() && !m_busy; });
+	}
+
+private:
+	void Run() {
+		std::unique_lock lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return !m_queue.empty(); });
+			while (!m_queue.empty()) {
+				const Item item = m_queue.front();
+				m_queue.pop_front();
+				m_busy = true;
+				lock.unlock();
+				vmaDestroyImage(item.allocator, item.image, item.allocation);
+				lock.lock();
+				m_busy = false;
+			}
+			m_idle.notify_all();
+		}
+	}
+
+	std::mutex              m_mutex;
+	std::condition_variable m_wake;
+	std::condition_variable m_idle;
+	std::deque<Item>        m_queue;
+	bool                    m_busy = false;
+	std::thread             m_thread;
+};
+
+ImageDestroyer& GetImageDestroyer() {
+	static auto* destroyer = new ImageDestroyer; // never destroyed; the thread ends with the process
+	return *destroyer;
+}
+
+} // namespace
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -56,6 +123,7 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	GetImageDestroyer().Drain();
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -136,9 +204,17 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+	auto              result      = static_cast<vk::Result>(
+        vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (result != vk::Result::eSuccess) {
+		// Images queued for destruction still hold device memory; release them and retry once.
+		GetImageDestroyer().Drain();
+		native_image = VK_NULL_HANDLE;
+		result       = static_cast<vk::Result>(vmaCreateImage(
+            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+            &alloc_info, &native_image, &image.allocation, nullptr));
+	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
@@ -163,7 +239,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	GetImageDestroyer().Push({allocator, image.image, image.allocation});
 	image.image      = nullptr;
 	image.allocation = nullptr;
 }

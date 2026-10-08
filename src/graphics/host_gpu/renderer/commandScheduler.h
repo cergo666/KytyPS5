@@ -93,6 +93,7 @@ private:
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	std::queue<PendingOperation> m_pending_operations;
+	uint32_t                     m_refresh_skip = 0;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;

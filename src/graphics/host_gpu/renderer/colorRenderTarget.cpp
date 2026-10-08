@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <array>
 #include <atomic>
 #include <bit>
 
@@ -71,6 +73,24 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
+	// The descriptor derived from the registers below is a pure function of them. Draws almost
+	// always repeat the previous draw's render-target registers, so reuse the last result when
+	// the register block is byte-identical (identical bytes imply identical values).
+	struct DescriptorMemo {
+		HW::RenderTarget rt;
+		uint32_t         mask  = 0;
+		uint32_t         slice = 0;
+		RenderColorInfo  info;
+		bool             valid = false;
+	};
+	static thread_local std::array<DescriptorMemo, RENDER_COLOR_ATTACHMENTS_MAX> s_memo;
+	auto&      memo     = s_memo[rt_slot];
+	const bool memo_hit = memo.valid && memo.mask == mask &&
+	                      memo.slice == render_target_slice_offset &&
+	                      std::memcmp(&memo.rt, &rt, sizeof(rt)) == 0;
+	if (memo_hit) {
+		r = memo.info;
+	} else {
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
@@ -331,11 +351,17 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
-	r.guest_mip_level          = rt.view.current_mip_level;
-	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
-	r.export_mapping           = target_format.export_mapping;
+	r.guest_mip_level   = rt.view.current_mip_level;
+	r.guest_array_layer = view.base_layer;
+	r.export_mapping    = target_format.export_mapping;
+	memo.rt             = rt;
+	memo.mask           = mask;
+	memo.slice          = render_target_slice_offset;
+	memo.info           = r;
+	memo.valid          = true;
+	}
+	auto& texture_cache = m_context.GetTextureCache();
+	r.image_id          = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

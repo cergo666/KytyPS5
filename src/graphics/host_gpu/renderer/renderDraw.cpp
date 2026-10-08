@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderDeferred.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -37,6 +38,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -465,6 +467,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
                                                  std::span<PreparedBindings* const> stages) {
+	KYTY_PROFILER_BLOCK("Draw::AcquireRenderTargets");
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects = {};
 	auto&       cache = m_context.GetTextureCache();
@@ -612,6 +615,7 @@ enum class CbColorMode : uint8_t {
 };
 
 static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
+	KYTY_PROFILER_BLOCK("Draw::ConsumeMetadataColorOp");
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
 	// These special modes run color-buffer metadata or decompression operations. The shader is a
@@ -687,6 +691,7 @@ struct PreparedVertexBuffers {
 
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
                                                   const ShaderVertexInputInfo& vs_input_info) {
+	KYTY_PROFILER_BLOCK("Draw::AcquireVertexBuffers");
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
@@ -862,6 +867,20 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+static std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
+ComputeTargetExportMapping(const HW::Context& ctx, uint32_t color_output_mask) {
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& rt = ctx.GetRenderTarget(slot);
+		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
+			mapping[slot] = TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
+			                                             rt.info.channel_order)
+			                    .export_mapping;
+		}
+	}
+	return mapping;
+}
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            uint32_t color_output_mask, DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -873,17 +892,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 
 	state.programs      = {};
 	state.ps_input_info = {};
-	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
-	    target_export_mapping {};
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		const auto& rt = ctx.GetRenderTarget(slot);
-		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
-			target_export_mapping[slot] =
-			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
-			                                 rt.info.channel_order)
-			        .export_mapping;
-		}
-	}
+	const auto target_export_mapping = ComputeTargetExportMapping(ctx, color_output_mask);
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
@@ -893,15 +902,84 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
 }
 
+static bool SnapshotsEqual(const ShaderRecompiler::IR::ResourceSnapshot* a,
+                           const ShaderRecompiler::IR::ResourceSnapshot* b) {
+	if (a == nullptr || b == nullptr) {
+		return a == b;
+	}
+	return a->buffers == b->buffers && a->images == b->images && a->samplers == b->samplers &&
+	       a->flattened_srt == b->flattened_srt && a->user_data == b->user_data &&
+	       a->specialization_reads == b->specialization_reads && a->uniform_fill == b->uniform_fill;
+}
+
+// Command-processor thread. Replaces RefreshShaders for a deferred draw.
+static void ApplyDeferredShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                 DeferredDraw& deferred, DrawRenderState& state,
+                                 DeferredDrawQueue* queue) {
+	auto& pipeline      = buffer.GetContext().GetPipelineCache();
+	state.vertex_info   = deferred.vertex_info;
+	state.ps_input_info = deferred.ps_info;
+	if (draw.IsIndexed()) {
+		LogDrawPhase(draw.Name(), "GetGraphicsProgramsAsync");
+	}
+	state.programs = pipeline.ResolveGraphicsProgramsAsync(deferred.prepared, deferred.async,
+	                                                       state.vertex_info, state.ps_input_info);
+	if (queue == nullptr) {
+		return;
+	}
+	const bool used_async = (deferred.async.vertex.valid && deferred.async.vertex.task != nullptr);
+	queue->total_async_hits += used_async ? 1 : 0;
+	queue->total_fallbacks += used_async ? 0 : 1;
+	if (!queue->verify) {
+		return;
+	}
+	auto vertex_info = deferred.vertex_info;
+	auto ps_info     = deferred.ps_info;
+	pipeline.WaitAsyncIdle();
+	const auto reference =
+	    pipeline.ResolveGraphicsPrograms(deferred.prepared, vertex_info, ps_info);
+	const bool same = reference.vertex[0].id == state.programs.vertex[0].id &&
+	                  reference.pixel.id == state.programs.pixel.id &&
+	                  SnapshotsEqual(vertex_info[0].stage.resources,
+	                                 state.vertex_info[0].stage.resources) &&
+	                  (!deferred.ps_active ||
+	                   SnapshotsEqual(ps_info.stage.resources, state.ps_input_info.stage.resources));
+	queue->total_verified++;
+	if (!same) {
+		queue->total_mismatches++;
+		if (queue->total_mismatches <= 16) {
+			std::printf("[AsyncDraw] MISMATCH #%llu (async_used=%d vs=%llu/%llu ps=%llu/%llu)\n",
+			            static_cast<unsigned long long>(queue->total_mismatches), used_async ? 1 : 0,
+			            static_cast<unsigned long long>(state.programs.vertex[0].id),
+			            static_cast<unsigned long long>(reference.vertex[0].id),
+			            static_cast<unsigned long long>(state.programs.pixel.id),
+			            static_cast<unsigned long long>(reference.pixel.id));
+		}
+	}
+	if (queue->total_verified % 200000 == 0) {
+		std::printf("[AsyncDraw] verified=%llu mismatches=%llu async_hits=%llu fallbacks=%llu\n",
+		            static_cast<unsigned long long>(queue->total_verified),
+		            static_cast<unsigned long long>(queue->total_mismatches),
+		            static_cast<unsigned long long>(queue->total_async_hits),
+		            static_cast<unsigned long long>(queue->total_fallbacks));
+	}
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
-	                                        DrawRenderState& state) {
+	                                        DrawRenderState& state,
+	                                        DeferredDraw* deferred) {
+	KYTY_PROFILER_BLOCK("Draw::PrepareDrawRenderState");
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	if (deferred != nullptr) {
+		ApplyDeferredShaders(buffer, draw, *deferred, state, m_deferred.get());
+	} else {
+		RefreshShaders(buffer, draw, color_output_mask, state);
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -939,6 +1017,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
+	KYTY_PROFILER_BLOCK("Draw::PrepareIndexBuffer");
 	PreparedIndexBuffer prepared;
 	if (source.size == 0) {
 		return prepared;
@@ -959,6 +1038,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 
 static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
+	KYTY_PROFILER_BLOCK("Draw::CommitVertexBuffers");
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
 	}
@@ -997,6 +1077,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
+	KYTY_PROFILER_BLOCK("Draw::EmitDrawPrimitives");
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1033,14 +1114,37 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 }
 
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
-                                         const DrawCallInfo& draw, DrawRenderState& state,
-                                         vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
+                                         const DrawCallInfo& draw_in, DrawRenderState& state,
+                                         vk::PrimitiveTopology topology, const DrawEmitInfo& emit_in,
                                          const DrawIndexBufferSource& index_source,
-	                                     bool primitive_restart_enable) {
+	                                     bool primitive_restart_enable, uint64_t gpu_args_addr) {
+	KYTY_PROFILER_BLOCK("Draw::ExecutePreparedDraw");
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+
+	// A GPU-resident argument buffer is drawn natively. Mesh shaders need the counts on the host,
+	// so they read the arguments back here (waiting for the GPU) and draw as before.
+	DrawCallInfo draw = draw_in;
+	DrawEmitInfo emit = emit_in;
+	if (gpu_args_addr != 0 &&
+	    (mesh_active || ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy)) {
+		m_context.GetBufferCache().ReadMemory(gpu_args_addr, 16);
+		uint32_t raw[4] {};
+		if (!LibKernel::Memory::TryReadBacking(gpu_args_addr, raw, sizeof(raw))) {
+			EXIT("indirect draw arguments are unreadable\n");
+		}
+		draw.index_count    = raw[0];
+		draw.instance_count = raw[1];
+		const bool native   = !state.vertex_info[0].fetch_embedded;
+		emit.first_vertex   = native ? 0 : raw[2];
+		emit.first_instance = native ? 0 : raw[3];
+		gpu_args_addr       = 0;
+		if (draw.index_count == 0 || draw.instance_count == 0) {
+			return;
+		}
+	}
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
@@ -1099,6 +1203,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	vk::Buffer args_buffer;
+	uint64_t   args_offset = 0;
+	if (gpu_args_addr != 0) {
+		const auto [obtained, offset] =
+		    m_context.GetBufferCache().ObtainBuffer(gpu_args_addr, 16, false);
+		EXIT_IF(obtained == nullptr || (offset & 3u) != 0);
+		args_buffer = obtained->Handle();
+		args_offset = offset;
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1148,6 +1261,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
+	if (gpu_args_addr != 0) {
+		// The arguments may have been written by earlier shaders or copies on the GPU.
+		m_context.GetCommandScheduler().EndRendering();
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+		                              vk::PipelineStageFlagBits::eComputeShader |
+		                              vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr,
+		                          0, nullptr);
+	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (!draw.IsIndexed()) {
@@ -1155,6 +1280,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+	} else if (gpu_args_addr != 0) {
+		vk_buffer.drawIndirect(args_buffer, args_offset, 1, 16);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
@@ -1183,6 +1310,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	DrawIndexImpl(submit_id, buffer, args, nullptr);
+}
+
+void RenderExecutor::DrawIndexImpl(uint64_t submit_id, CommandBuffer& buffer,
+                                   const DrawIndexArgs& args, DeferredDraw* deferred) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1270,7 +1402,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state,
+	                            deferred)) {
 		ResetBindings();
 		return;
 	}
@@ -1296,6 +1429,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+	DrawAutoImpl(submit_id, buffer, args, nullptr);
+}
+
+void RenderExecutor::DrawAutoImpl(uint64_t submit_id, CommandBuffer& buffer,
+                                  const DrawAutoArgs& args, DeferredDraw* deferred) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1309,7 +1447,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.vertex_count == 0 || args.instance_count == 0) {
+	if (args.gpu_args_addr == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return;
 	}
 
@@ -1349,7 +1487,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state, deferred)) {
 		ResetBindings();
 		return;
 	}
@@ -1381,11 +1519,13 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.first_instance = native_indirect ? 0 : instance_offset;
 
 	DrawIndexBufferSource index_source {};
-	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
+	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false,
+	                    args.gpu_args_addr);
 	ResetBindings();
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {
+	KYTY_PROFILER_BLOCK("Draw::ResolveColorTargets");
 	const auto& hw = buffer.GetRegisters();
 	if (hw.GetColorControl().mode != 3) {
 		return false;
@@ -1417,6 +1557,279 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
 	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
 	return true;
+}
+
+RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
+
+RenderExecutor::~RenderExecutor() = default;
+
+bool RenderExecutor::HasDeferredDraws() const noexcept {
+	return m_deferred != nullptr && m_deferred->count != 0;
+}
+
+bool RenderExecutor::TryDeferDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+                                       const DrawIndexArgs& args) {
+	return TryDeferGraphics(submit_id, buffer, &args, nullptr);
+}
+
+bool RenderExecutor::TryDeferDrawAuto(uint64_t submit_id, CommandBuffer& buffer,
+                                      const DrawAutoArgs& args) {
+	static const bool disabled = [] {
+		const char* env = std::getenv("KYTY_NO_DEFER_AUTO");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (disabled || args.gpu_args_addr != 0) {
+		return false;
+	}
+	return TryDeferGraphics(submit_id, buffer, nullptr, &args);
+}
+
+bool RenderExecutor::TryDeferGraphics(uint64_t submit_id, CommandBuffer& buffer,
+                                      const DrawIndexArgs* indexed,
+                                      const DrawAutoArgs* automatic) {
+	KYTY_PROFILER_BLOCK("Draw::Defer");
+	auto& pipeline = m_context.GetPipelineCache();
+	if (!pipeline.AsyncEnabled()) {
+		return false;
+	}
+	if (m_deferred == nullptr) {
+		m_deferred = std::make_unique<DeferredDrawQueue>();
+		const char* verify = std::getenv("KYTY_ASYNC_VERIFY");
+		m_deferred->verify = verify != nullptr && verify[0] == '1';
+		if (const char* debug = std::getenv("KYTY_ASYNC_DEBUG"); debug != nullptr) {
+			m_deferred->debug_flags = static_cast<uint32_t>(std::atoi(debug));
+		}
+	}
+	auto& queue = *m_deferred;
+	const bool        is_indexed = indexed != nullptr;
+	const uint32_t    count      = is_indexed ? indexed->index_count : automatic->vertex_count;
+	const uint32_t    instances  = is_indexed ? indexed->instance_count : automatic->instance_count;
+	const auto        source     = is_indexed ? indexed->offset_source : automatic->offset_source;
+	if (queue.flushing || buffer.IsInvalid() || count == 0 || instances == 0 ||
+	    source != DrawOffsetSource::DrawState || graphics_debug_dump_enabled()) {
+		return false;
+	}
+
+	KYTY_PROFILER_BLOCK("Defer::Checks");
+	const auto& ctx  = buffer.GetRegisters();
+	const auto& ucfg = buffer.GetUserConfig();
+	const auto& sh   = buffer.GetShaders();
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	// Tessellation and merged (NGG) vertex stages keep using the synchronous path.
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch ||
+	    (ctx.GetShaderStages() & 0x20u) != 0 || !DrawHasValidVertexShader(sh) ||
+	    !GetDrawTopology(ucfg, topology)) {
+		return false;
+	}
+
+	if (queue.count == DeferredDrawQueue::kCapacity) {
+		FlushDeferredDraws();
+	}
+	auto& slot = queue.slots[(queue.head + queue.count) % DeferredDrawQueue::kCapacity];
+	if (slot == nullptr) {
+		slot = std::make_unique<DeferredDraw>();
+	}
+	DeferredDraw& draw = *slot;
+	draw.kind          = is_indexed ? DeferredDraw::Kind::Draw : DeferredDraw::Kind::DrawAuto;
+	draw.submit_id     = submit_id;
+	if (is_indexed) {
+		draw.args = *indexed;
+	} else {
+		draw.auto_args = *automatic;
+	}
+	{
+		KYTY_PROFILER_BLOCK("Defer::Snapshot");
+		draw.ctx = ctx;
+		draw.ucfg = ucfg;
+		draw.sh = sh;
+	}
+
+	const auto& regs             = draw.ctx;
+	const auto  color_output_mask = DrawColorOutputMask(regs);
+	draw.ps_active = draw.sh.GetPs().ps_regs.data_addr != 0 &&
+	                 (color_output_mask != 0 ||
+	                  PixelShaderHasDepthOrCoverageSideEffects(regs.GetShaderRegisters()));
+	{
+		KYTY_PROFILER_BLOCK("Defer::Reset");
+		draw.vertex_info = {};
+		draw.ps_info     = {};
+	}
+	const auto mapping = ComputeTargetExportMapping(regs, color_output_mask);
+	{
+		KYTY_PROFILER_BLOCK("Defer::Prepare");
+		draw.prepared = pipeline.PrepareGraphicsPrograms(
+		    draw.sh.GetVs(), draw.sh.GetPs(), regs.GetShaderRegisters(), regs, draw.ucfg, mapping,
+		    draw.ps_active, draw.vertex_info, draw.ps_info);
+	}
+	{
+		KYTY_PROFILER_BLOCK("Defer::Submit");
+		pipeline.SubmitGraphicsAsync(draw.prepared, draw.vertex_info, draw.ps_info,
+		                             m_context.GetBufferCache().GpuDirtyClearEpoch(), draw.async);
+	}
+	queue.count++;
+	queue.total_deferred++;
+	if ((queue.debug_flags & 2u) != 0) {
+		FlushDeferredDraws();
+	}
+	return true;
+}
+
+bool RenderExecutor::TryDeferDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+                                            uint32_t thread_group_x, uint32_t thread_group_y,
+                                            uint32_t thread_group_z, uint32_t mode) {
+	KYTY_PROFILER_BLOCK("Dispatch::Defer");
+	// Deferring compute dispatches measured no faster than running them in order (the cost is in
+	// the in-order binding work, not in resource materialization), so it is opt-in.
+	static const bool compute_enabled = [] {
+		const char* env = std::getenv("KYTY_ASYNC_COMPUTE");
+		return env != nullptr && env[0] == '1';
+	}();
+	auto& pipeline = m_context.GetPipelineCache();
+	if (!compute_enabled || !pipeline.AsyncEnabled()) {
+		return false;
+	}
+	if (m_deferred == nullptr) {
+		m_deferred = std::make_unique<DeferredDrawQueue>();
+		const char* verify = std::getenv("KYTY_ASYNC_VERIFY");
+		m_deferred->verify = verify != nullptr && verify[0] == '1';
+		if (const char* debug = std::getenv("KYTY_ASYNC_DEBUG"); debug != nullptr) {
+			m_deferred->debug_flags = static_cast<uint32_t>(std::atoi(debug));
+		}
+	}
+	auto& queue = *m_deferred;
+	if (queue.flushing || buffer.IsInvalid() || thread_group_x == 0 || thread_group_y == 0 ||
+	    thread_group_z == 0 || graphics_debug_dump_enabled() ||
+	    buffer.GetShaders().GetCs().cs_regs.data_addr == 0) {
+		return false;
+	}
+
+	if (queue.count == DeferredDrawQueue::kCapacity) {
+		FlushDeferredDraws();
+	}
+	auto& slot = queue.slots[(queue.head + queue.count) % DeferredDrawQueue::kCapacity];
+	if (slot == nullptr) {
+		slot = std::make_unique<DeferredDraw>();
+	}
+	DeferredDraw& op = *slot;
+	op.kind          = DeferredDraw::Kind::Dispatch;
+	op.submit_id     = submit_id;
+	op.groups        = {thread_group_x, thread_group_y, thread_group_z};
+	op.mode          = mode;
+	op.ctx           = buffer.GetRegisters();
+	op.ucfg          = buffer.GetUserConfig();
+	op.sh            = buffer.GetShaders();
+
+	constexpr uint32_t kUseThreadDimensions = 1u << 5u;
+	auto&              info                 = op.compute_info;
+	info                                    = {};
+	const bool use_thread_dimensions        = (mode & kUseThreadDimensions) != 0;
+	info.dispatch_thread_dimensions         = use_thread_dimensions;
+	info.workgroup_counts[0]                = thread_group_x;
+	info.workgroup_counts[1]                = thread_group_y;
+	info.workgroup_counts[2]                = thread_group_z;
+	if (use_thread_dimensions) {
+		const auto&    cs          = op.sh.GetCs().cs_regs;
+		const uint32_t group_sizes[] = {cs.num_thread_x, cs.num_thread_y, cs.num_thread_z};
+		for (uint32_t axis = 0; axis < 3u; ++axis) {
+			const auto size    = std::max(group_sizes[axis], 1u);
+			const auto threads = info.workgroup_counts[axis];
+			info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
+		}
+	}
+	op.compute_params = pipeline.PrepareComputeProgram(op.sh.GetCs(),
+	                                                   op.ctx.GetShaderRegisters(), info);
+	op.compute_async  = pipeline.SubmitComputeAsync(
+        op.compute_params, info, m_context.GetBufferCache().GpuDirtyClearEpoch());
+	queue.count++;
+	queue.total_deferred++;
+	return true;
+}
+
+// Whether a worker result can still be trusted: it must have succeeded, and none of the guest
+// memory it read may have been written by the GPU (or downloaded) since it was submitted.
+static bool AsyncTaskStillValid(BufferCache& cache, const MaterializeTask& task) {
+	KYTY_PROFILER_BLOCK("Draw::ValidateAsync");
+	if (!task.ok || cache.GpuDirtyClearEpoch() != task.dirty_epoch) {
+		return false;
+	}
+	uint64_t low = 0, high = 0;
+	if (!cache.GpuDirtyBounds(low, high)) {
+		return true; // nothing is GPU-modified, so no read can have raced a GPU write
+	}
+	for (const auto& read: task.reads) {
+		// Most reads (constant tables) lie far from GPU-written buffers.
+		if (read.address >= high || read.address + read.size <= low) {
+			continue;
+		}
+		if (cache.HasGpuDirtyBytes(read.address, read.size)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void RenderExecutor::FlushDeferredDraws() {
+	if (m_deferred == nullptr || m_deferred->count == 0 || m_deferred->flushing) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("Draw::FlushDeferred");
+	auto& queue    = *m_deferred;
+	queue.flushing = true;
+	auto& pipeline = m_context.GetPipelineCache();
+	while (queue.count != 0) {
+		DeferredDraw& draw = *queue.slots[queue.head];
+		const bool    is_dispatch = draw.kind == DeferredDraw::Kind::Dispatch;
+		std::array<PipelineCache::AsyncGraphics::Stage*, 2> stages {
+		    is_dispatch ? &draw.compute_async : &draw.async.vertex,
+		    is_dispatch ? nullptr : &draw.async.pixel};
+		for (auto* stage: stages) {
+			if (stage != nullptr && stage->task != nullptr) {
+				{
+					KYTY_PROFILER_BLOCK("Flush::WaitWorker");
+					AsyncMaterializer::Wait(stage->task);
+				}
+				stage->valid = (queue.debug_flags & 1u) == 0 &&
+				               AsyncTaskStillValid(m_context.GetBufferCache(), *stage->task);
+			}
+		}
+		auto& buffer      = m_context.GetCommandScheduler().Current();
+		const auto saved  = buffer.SwapState(draw.ctx, draw.ucfg, draw.sh);
+		if (is_dispatch) {
+			DispatchDirectImpl(draw.submit_id, buffer, draw.groups[0], draw.groups[1],
+			                   draw.groups[2], draw.mode, &draw);
+		} else {
+			if (draw.kind == DeferredDraw::Kind::DrawAuto) {
+				DrawAutoImpl(draw.submit_id, buffer, draw.auto_args, &draw);
+			} else {
+				DrawIndexImpl(draw.submit_id, buffer, draw.args, &draw);
+			}
+		}
+		buffer.RestoreState(saved);
+		if (is_dispatch) {
+			pipeline.ReleaseAsyncStage(draw.compute_async);
+		} else {
+			pipeline.ReleaseGraphicsAsync(draw.async);
+		}
+		queue.head = (queue.head + 1) % DeferredDrawQueue::kCapacity;
+		queue.count--;
+		m_ops_since_submit++;
+	}
+	queue.flushing = false;
+
+	// The guest submits one large command buffer at a time, so without this the GPU would sit idle
+	// until the command processor has recorded the whole thing. Hand the GPU work in slices.
+	static const uint32_t submit_interval = [] {
+		const char* env = std::getenv("KYTY_SUBMIT_INTERVAL");
+		return env != nullptr ? static_cast<uint32_t>(std::atoi(env)) : 0u;
+	}();
+	if (submit_interval != 0 && m_ops_since_submit >= submit_interval) {
+		m_ops_since_submit = 0;
+		auto& scheduler    = m_context.GetCommandScheduler();
+		if (scheduler.Active() && !scheduler.Current().IsInvalid()) {
+			KYTY_PROFILER_BLOCK("Draw::SliceSubmit");
+			scheduler.Flush();
+		}
+	}
 }
 
 } // namespace Libs::Graphics

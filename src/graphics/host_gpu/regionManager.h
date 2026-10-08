@@ -87,6 +87,13 @@ public:
 		m_cpu_dirty.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
+		BumpCpuDirtyGeneration();
+	}
+
+	// Advances whenever any page may have become CPU-dirty, so callers can skip re-scanning
+	// tracked memory while it is unchanged. Bump only after the dirty bits are published.
+	[[nodiscard]] static uint64_t CpuDirtyGeneration() {
+		return s_cpu_dirty_generation.load(std::memory_order_acquire);
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -121,6 +128,9 @@ public:
 			UpdateProtection<!enable, false>();
 		} else {
 			UpdateProtection<enable, true>();
+		}
+		if constexpr (source == DirtySource::Cpu && enable) {
+			BumpCpuDirtyGeneration();
 		}
 	}
 
@@ -187,6 +197,11 @@ private:
 		return {static_cast<size_t>(offset / TRACKER_PAGE_SIZE),
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}
+
+	static void BumpCpuDirtyGeneration() {
+		s_cpu_dirty_generation.fetch_add(1, std::memory_order_acq_rel);
+	}
+	inline static std::atomic_uint64_t s_cpu_dirty_generation {0};
 
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;

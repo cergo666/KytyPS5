@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <atomic>
 #include <map>
 #include <span>
 #include <utility>
@@ -77,10 +78,23 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Address span covered by GPU-modified bytes; false when there are none.
+	[[nodiscard]] bool GpuDirtyBounds(uint64_t& low, uint64_t& high) const {
+		return m_gpu_modified_ranges.Bounds(low, high);
+	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Advances when a cached buffer is added or removed.
+	// Advances whenever GPU-modified bytes are downloaded to guest memory (and so stop being
+	// dirty), letting asynchronous guest-memory readers detect that data they read may be stale.
+	[[nodiscard]] uint64_t GpuDirtyClearEpoch() const {
+		return m_gpu_dirty_clear_epoch.load(std::memory_order_acquire);
+	}
+	[[nodiscard]] uint64_t BuffersGeneration() const {
+		return m_buffers_generation.load(std::memory_order_acquire);
+	}
 	void               RunGarbageCollector();
 
 private:
@@ -129,6 +143,8 @@ private:
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
+	std::atomic_uint64_t                              m_buffers_generation {0};
+	std::atomic_uint64_t                              m_gpu_dirty_clear_epoch {0};
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	MemoryTracker                                     m_memory_tracker;
