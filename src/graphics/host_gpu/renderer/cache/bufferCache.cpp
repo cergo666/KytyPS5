@@ -84,6 +84,7 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
+	m_registration_epoch++;
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
 	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -281,8 +282,88 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	EraseKnownFills(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+}
+
+void BufferCache::EraseKnownFills(uint64_t vaddr, uint64_t size) {
+	if (m_known_fill_count.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	std::lock_guard lock(m_known_fill_mutex);
+	std::erase_if(m_known_fills, [&](const KnownFill& fill) {
+		return fill.address < vaddr + size && vaddr < fill.address + fill.size;
+	});
+	m_known_fill_count.store(static_cast<uint32_t>(m_known_fills.size()), std::memory_order_release);
+}
+
+void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value) {
+	static const bool disabled = [] {
+		const char* env = std::getenv("KYTY_NO_KNOWN_FILL");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (disabled || size == 0 || size > 16ull * 1024 * 1024) {
+		return;
+	}
+	EraseKnownFills(vaddr, size);
+	std::lock_guard lock(m_known_fill_mutex);
+	if (m_known_fills.size() >= 64) {
+		m_known_fills.erase(m_known_fills.begin());
+	}
+	m_known_fills.push_back({vaddr, size, value});
+	m_known_fill_count.store(static_cast<uint32_t>(m_known_fills.size()), std::memory_order_release);
+}
+
+bool BufferCache::TryResolveKnownFill(uint64_t vaddr, uint64_t size) {
+	if (m_known_fill_count.load(std::memory_order_acquire) == 0) {
+		return false;
+	}
+	KnownFill fill;
+	{
+		std::lock_guard lock(m_known_fill_mutex);
+		const auto it = std::find_if(m_known_fills.begin(), m_known_fills.end(), [&](const KnownFill& f) {
+			return f.address <= vaddr && vaddr + size <= f.address + f.size;
+		});
+		if (it == m_known_fills.end()) {
+			return false;
+		}
+		fill = *it;
+	}
+	// Every byte a download would publish must lie inside the fill.
+	bool inside = true;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    inside &= fill.address <= start && end <= fill.address + fill.size;
+		    });
+	    });
+	if (!inside) {
+		return false;
+	}
+	KYTY_PROFILER_BLOCK("Buf::KnownFill");
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		                                           "known fill");
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    ranges.emplace_back(start, end);
+		    });
+		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    m_gpu_dirty_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
+	    });
+	std::vector<uint8_t> bytes;
+	for (const auto& [start, end]: ranges) {
+		bytes.resize(end - start);
+		for (uint64_t i = 0; i < bytes.size(); i++) {
+			const auto phase = (start + i - fill.address) % sizeof(uint32_t);
+			bytes[i]         = static_cast<uint8_t>(fill.value >> (8u * phase));
+		}
+		Libs::LibKernel::Memory::WriteBacking(start, bytes.data(), bytes.size());
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	return true;
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -415,13 +496,21 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
-	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	// Read before scanning: a CPU write that lands after the scan advances it past this value.
+	const auto generation = m_memory_tracker.CpuDirtyGeneration();
+	const bool whole      = vaddr == buffer.CpuAddress() && size == buffer.Size();
+	if (is_written || buffer.cpu_sync_generation != generation) {
+		m_memory_tracker.ForEachUploadRange(
+		    vaddr, size, is_written,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+			    total_size += bytes;
+		    },
+		    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+		if (whole) {
+			buffer.cpu_sync_generation = generation;
+		}
+	}
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -513,6 +602,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		EraseKnownFills(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

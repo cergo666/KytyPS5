@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderCheckpoint.h"
 #include "graphics/host_gpu/renderer/renderDeferred.h"
 #include "graphics/host_gpu/renderer/renderDiag.h"
+#include "graphics/host_gpu/renderer/renderDrawStats.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -14,6 +15,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -22,8 +24,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
@@ -245,6 +247,7 @@ void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffe
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
+	ResolvePendingMetaClears(buffer);
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
@@ -355,6 +358,16 @@ void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffe
 			(void)last_hash;
 		}
 	}
+	// A dispatch that fills one buffer with one value (the metadata clears) still runs on the GPU,
+	// but its result is remembered so later read-backs of those bytes need not wait.
+	ShaderBufferResource known_fill_descriptor;
+	uint32_t             known_fill_value = 0;
+	uint64_t             known_fill_size  = 0;
+	const bool           known_fill =
+	    resources.uniform_fill.kind == ShaderRecompiler::IR::UniformFillKind::Buffer &&
+	    resources.uniform_fill.words == 1 &&
+	    ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+	                             known_fill_descriptor, known_fill_value, known_fill_size);
 	{
 	KYTY_PROFILER_BLOCK("Cmp::MetaClear");
 	if (resources.specialization_reads.empty() &&
@@ -419,6 +432,10 @@ void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffe
 	BindSharedMemory(m_context, input_info, bindings);
 	}
 	RebindBuffers(bindings);
+	if (known_fill) {
+		m_context.GetBufferCache().RecordKnownFill(known_fill_descriptor.Base48(), known_fill_size,
+		                                           known_fill_value);
+	}
 
 	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -501,6 +518,10 @@ void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffe
 
 	{
 	KYTY_PROFILER_BLOCK("Cmp::Emit");
+	if (DrawStats::Enabled()) {
+		DrawStats::RecordDispatch(program.shader_hash, static_cast<uint64_t>(thread_group_x) *
+		                                                   thread_group_y * thread_group_z);
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	Checkpoint::Mark(vk_buffer, 2, submit_id, program.shader_hash, 0, thread_group_x, thread_group_y,
 	                 thread_group_z);
@@ -512,7 +533,46 @@ void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffe
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	// A shader rewriting color metadata performs a fast clear; the target may only be
+	// programmed later, so remember the range until a color slot names it.
+	constexpr size_t MaxPendingMetaFills = 1024;
+	if (m_pending_meta_fills.size() > MaxPendingMetaFills) {
+		m_pending_meta_fills.clear();
+	}
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (!program.info.buffers[i].written) continue;
+		const auto d = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (d.Base48() != 0 && d.GetSize() <= 0x40000) m_pending_meta_fills.insert(d.Base48());
+	}
+	ResolvePendingMetaClears(buffer);
 	ResetBindings();
+}
+
+// Clear the color targets whose fast-clear metadata was rewritten by a shader, with or
+// without a draw: the texture reads that follow expect the cleared color.
+void RenderExecutor::ResolvePendingMetaClears(CommandBuffer& buffer) {
+	if (m_pending_meta_fills.empty()) {
+		return;
+	}
+	const auto& hw = buffer.GetRegisters();
+	for (uint32_t slot = 0; slot < 8; slot++) {
+		const auto& rt = hw.GetRenderTarget(slot);
+		// Same eligibility as ResolveRenderColorTarget, so a fill is only consumed when the
+		// target can attach the rewritten metadata.
+		const bool dcc = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
+		const bool cmask =
+		    !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
+		    rt.cmask.addr != 0 && render_sample_count(rt.attrib.num_fragments) == 1 &&
+		    !rt.info.fmask_compression_enable && !rt.attrib3.write_vrs_rate_hint_to_cmask;
+		if (rt.base.addr == 0 || (!dcc && !cmask)) {
+			continue;
+		}
+		if (m_pending_meta_fills.erase(dcc ? rt.dcc_addr.addr : rt.cmask.addr) == 0) {
+			continue;
+		}
+		RenderColorInfo color {};
+		ResolveRenderColorTarget(buffer, color, 0, slot, true, false);
+	}
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,

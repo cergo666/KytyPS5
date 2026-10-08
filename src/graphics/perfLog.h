@@ -9,6 +9,8 @@ namespace Libs::Graphics::PerfLog {
 void Start();
 // Counts one presented frame.
 void CountFrame();
+// Number of frames counted so far.
+unsigned long long FrameCount();
 // Registers the calling thread under a label ("cp") so its CPU use is reported separately.
 void RegisterThisThread(const char* label);
 

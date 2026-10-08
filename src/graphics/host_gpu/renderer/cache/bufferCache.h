@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -84,6 +85,12 @@ public:
 	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// A compute dispatch that fills [vaddr, vaddr + size) with one 32-bit value was just recorded.
+	// Until anything else writes there, the bytes are known without reading them back.
+	void RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	// When the GPU-modified bytes of the range are entirely covered by a known fill, publishes them
+	// to guest memory as a download would, but without waiting for the GPU. GPU thread only.
+	[[nodiscard]] bool TryResolveKnownFill(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Advances when a cached buffer is added or removed.
@@ -147,7 +154,16 @@ private:
 	std::atomic_uint64_t                              m_gpu_dirty_clear_epoch {0};
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	struct KnownFill {
+		uint64_t address = 0, size = 0;
+		uint32_t value = 0;
+	};
+	void                   EraseKnownFills(uint64_t vaddr, uint64_t size);
+	std::mutex             m_known_fill_mutex;
+	std::vector<KnownFill> m_known_fills;
+	std::atomic<uint32_t>  m_known_fill_count {0};
 	MemoryTracker                                     m_memory_tracker;
+	uint64_t                                          m_registration_epoch = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

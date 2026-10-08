@@ -46,7 +46,7 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
-		       DecodePackedColorClear(format, metadata.clear_word, clear);
+		       DecodeRegisterColorClear(format, metadata.clear_word, metadata.clear_word_hi, clear);
 	}
 	if (cmask) {
 		return false;
@@ -1145,22 +1145,71 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
+void TextureCache::MaterializeViewClear(ImageId id, const ImageDesc& desc) {
+	{
+		std::scoped_lock lock {m_lock};
+		const auto*      image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->info.metadata.clear_register_valid) {
+			return;
+		}
+	}
+	MaterializeColorClear(id, desc, desc.view_info.base_layer);
+}
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
-	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
-	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
+	const bool        desc_metadata = desc.info.metadata.kind == ImageMetadataKind::Dcc ||
+	                                  desc.info.metadata.kind == ImageMetadataKind::Cmask;
+	ImageMetadataInfo target {};
+	bool              use_target = false;
+	if (desc.type == BindingType::Texture || desc.type == BindingType::Storage) {
+		// A texture or storage view of a fast-cleared color target sees the clear as well, through
+		// the metadata and clear registers of the target's last binding, even if the view has DCC.
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		target                 = image.info.metadata;
+		use_target =
+		    (target.kind == ImageMetadataKind::Dcc || target.kind == ImageMetadataKind::Cmask) &&
+		    target.clear_register_valid && image.info.data == desc.info.data &&
+		    image.info.resources.levels == 1 &&
+		    image.info.resources.layers == desc.info.resources.layers &&
+		    desc.info.resources.levels == 1 && desc.view_info.level_count == 1 &&
+		    !image.info.IsVolume();
+	}
+	// Most lookups are plain textures of images without color metadata: leave before copying.
+	if (!desc_metadata && !use_target) {
+		if (desc.type == BindingType::RenderTarget) {
+			// A target bound without color metadata drops the previous binding's clear state.
+			std::scoped_lock lock {m_lock};
+			auto&            image = m_slot_images[id];
+			if (image.info.metadata.kind == ImageMetadataKind::Dcc ||
+			    image.info.metadata.kind == ImageMetadataKind::Cmask) {
+				image.info.metadata = desc.info.metadata;
+			}
+		}
 		return;
 	}
-	const auto range = desc.info.metadata.range;
-	{
+	ImageDesc clear_desc = desc;
+	auto&     metadata   = clear_desc.info.metadata;
+	if (use_target) {
+		metadata                    = target;
+		clear_desc.type             = BindingType::RenderTarget;
+		clear_desc.view_info.format = target.clear_format;
+	}
+	const auto range = metadata.range;
+	if (!use_target) {
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
+		// The clear registers are read through the target's format, not a later view's.
+		if (desc.type == BindingType::RenderTarget) {
+			image.info.metadata.clear_format = desc.view_info.format;
+		}
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
-		if (range.size == 0 || desc.info.resources.levels != 1) {
-			return;
-		}
+	}
+	if (range.size == 0 || desc.info.resources.levels != 1) {
+		return;
 	}
 	const auto layers = desc.info.TransferLayers();
 	// These one-mip surfaces use complete 4 KiB color metadata blocks.
@@ -1169,7 +1218,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
 		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
 	}
-	const auto& view           = desc.view_info;
+	const auto& view           = clear_desc.view_info;
 	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
 	const auto  first          = volume_texture ? 0u : metadata_base_layer;
 	const auto  image_first    = volume_texture ? 0u : view.base_layer;
@@ -1184,7 +1233,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (Diag::MetaEnabled()) {
 			Diag::ReportMetaReadback(range.address, range.size);
 		}
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		// A metadata clear dispatch usually wrote these bytes; when its value is known there is
+		// nothing to wait for.
+		if (!m_buffer_cache.TryResolveKnownFill(range.address, range.size)) {
+			m_buffer_cache.ReadMemory(range.address, range.size, false);
+		}
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
@@ -1194,7 +1247,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
-		if (!DecodeColorClear(desc, code, clear.color)) {
+		if (!DecodeColorClear(clear_desc, code, clear.color)) {
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);

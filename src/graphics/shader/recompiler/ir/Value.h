@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
+#include <atomic>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -123,11 +124,19 @@ public:
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
 	// Runtime indices belong to the resource plan that owns this instruction.
+	// Plans are evaluated on several threads at once; a slot that was not assigned up front is
+	// claimed atomically so two threads never disagree about it.
 	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
-		if (evaluation_index == UINT32_MAX) {
-			evaluation_index = count++;
+		std::atomic_ref<uint32_t> index(evaluation_index);
+		uint32_t                  current = index.load(std::memory_order_acquire);
+		if (current != UINT32_MAX) {
+			return current;
 		}
-		return evaluation_index;
+		const uint32_t fresh = std::atomic_ref<uint32_t>(count).fetch_add(1, std::memory_order_acq_rel);
+		if (index.compare_exchange_strong(current, fresh, std::memory_order_acq_rel)) {
+			return fresh;
+		}
+		return current; // another thread claimed it first; `fresh` stays unused
 	}
 
 	void SetParent(Block* block);
@@ -176,5 +185,114 @@ private:
 };
 
 static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
+
+// Hot accessors of the resource walker are defined inline; they need the full Inst.
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Value Value::Resolve() const {
+	// Identity chains are followed iteratively; the walker resolves every operand it visits.
+	Value value = *this;
+	while (value.IsIdentity()) {
+		value = value.inst->Arg(0);
+	}
+	return value;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	// An identity may forward an immediate: fail fast as the recursive form did.
+	const auto value = Resolve();
+	EXIT_IF(value.type != Type::Opaque);
+	return value.inst;
+}
+
+inline bool Value::U1() const {
+	EXIT_IF(type != Type::U1);
+	return imm_u1;
+}
+
+inline uint8_t Value::U8() const {
+	EXIT_IF(type != Type::U8);
+	return imm_u8;
+}
+
+inline uint16_t Value::U16() const {
+	EXIT_IF(type != Type::U16);
+	return imm_u16;
+}
+
+inline uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
+inline uint64_t Value::U64() const {
+	EXIT_IF(type != Type::U64);
+	return imm_u64;
+}
+
+inline uint16_t Value::F16Bits() const {
+	EXIT_IF(type != Type::F16);
+	return imm_u16;
+}
+
+inline float Value::F32Value() const {
+	EXIT_IF(type != Type::F32);
+	return std::bit_cast<float>(imm_u32);
+}
+
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
+inline size_t Inst::NumArgs() const {
+	return num_args == PhiArity ? phi_args.size() : num_args;
+}
+
+inline bool Value::operator==(const Value& other) const {
+	if (type != other.type) {
+		return false;
+	}
+	switch (type) {
+		case Type::Void: return true;
+		case Type::Opaque: return inst == other.inst;
+		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
+		case Type::VectorReg: return vector_reg == other.vector_reg;
+		case Type::U1: return imm_u1 == other.imm_u1;
+		case Type::U8: return imm_u8 == other.imm_u8;
+		case Type::U16:
+		case Type::F16: return imm_u16 == other.imm_u16;
+		case Type::U32:
+		case Type::F32: return imm_u32 == other.imm_u32;
+		case Type::U64: return imm_u64 == other.imm_u64;
+		default: return false;
+	}
+}
+
+inline Value Inst::Arg(size_t index) const {
+	EXIT_IF(index >= NumArgs());
+	if (num_args <= InlineArity) {
+		return fixed_args[index];
+	}
+	return num_args == PhiArity ? phi_args[index].second : large_args[index];
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

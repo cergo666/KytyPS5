@@ -3,7 +3,9 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <deque>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -26,6 +28,21 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
+
+// Evaluation scratch. It used to live inside the ResourcePlan, which made a plan usable by one thread
+// at a time; now each thread has its own, so one plan can be evaluated on several worker lanes.
+struct EvaluationScratch {
+	std::deque<ResourcePlan::EvaluationContext> contexts;
+	uint32_t                                    depth = 0;
+	std::vector<uint8_t>                        active_sources;
+	std::vector<uint8_t>                        visited_blocks;
+	std::vector<uint32_t>                       pending_blocks;
+	std::vector<uint32_t>                       material_keys;
+};
+EvaluationScratch& ThreadEvaluationScratch();
+// Fixes every instruction's evaluation slot up front. Must run before the plan is shared between
+// threads, because slots are otherwise assigned lazily on first evaluation.
+void AssignEvaluationIndices(ResourcePlan& plan);
 
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {

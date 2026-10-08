@@ -12,6 +12,10 @@ void CountFrame() {
 	g_frames.fetch_add(1, std::memory_order_relaxed);
 }
 
+unsigned long long FrameCount() {
+	return g_frames.load(std::memory_order_relaxed);
+}
+
 } // namespace Libs::Graphics::PerfLog
 
 #ifdef _WIN32
