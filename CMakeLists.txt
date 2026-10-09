@@ -762,6 +762,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME buffer_cache_detached_download
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-detached-only)
+	add_test(NAME texture_cache_lookup_reuse
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-lookup-only)
+	add_test(NAME texture_cache_imageless_invalidation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --imageless-invalidation-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 

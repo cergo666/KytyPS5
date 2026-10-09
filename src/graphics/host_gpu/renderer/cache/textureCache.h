@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -99,8 +100,49 @@ private:
 		int32_t layer = -1;
 	};
 
+	// The requested fields that decide an exact backing match (SameBacking).
+	struct ExactImageKey {
+		GuestRange          data;
+		vk::Extent3D        extent;
+		ImageSubresources   resources;
+		uint32_t            samples         = 1;
+		uint32_t            bytes_per_block = 0;
+		Prospero::TileMode  tile_mode       = Prospero::TileMode::kLinear;
+		ColorTransform      transform       = ColorTransform::None;
+		vk::Format          pixel_format    = vk::Format::eUndefined;
+		Prospero::ImageType type            = Prospero::ImageType::kColor2D;
+		bool                exact_format    = false;
+
+		bool operator==(const ExactImageKey&) const = default;
+	};
+	struct ExactImageKeyHash {
+		[[nodiscard]] size_t operator()(const ExactImageKey& key) const noexcept;
+	};
+	struct ExactImage {
+		ImageId  id;
+		uint64_t generation = 0;
+	};
+
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
+
+	// Registered images per page of the image page table. Written under m_lock, read without it.
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts() = default;
+		~RegisteredPageCounts();
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void               Add(size_t page, int32_t delta);
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept;
+
+	private:
+		static constexpr size_t kLeafBits = 10;
+		static constexpr size_t kLeafSize = size_t {1} << kLeafBits;
+		using Leaf                        = std::array<std::atomic<uint32_t>, kLeafSize>;
+
+		std::array<std::atomic<Leaf*>, ImagePageTable::kPageCount / kLeafSize> m_leaves {};
+	};
 
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
@@ -193,6 +235,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	RegisteredPageCounts                              m_registered_pages;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
@@ -219,6 +262,10 @@ private:
 	uint64_t         m_gc_frame               = UINT64_MAX;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	// Exact matches found by FindImage. The match depends on the registered images and on
+	// fields fixed at their creation, so an entry holds until a registration changes.
+	std::unordered_map<ExactImageKey, ExactImage, ExactImageKeyHash> m_exact_images;
+	uint64_t                                                         m_registration_generation = 1;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

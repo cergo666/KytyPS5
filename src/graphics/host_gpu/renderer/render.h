@@ -14,6 +14,7 @@
 #include <optional>
 #include <span>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -215,6 +216,8 @@ public:
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
+	// Sorted, disjoint ranges written by the bound images and shader buffers of a draw.
+	void GatherWriteRanges(std::span<PreparedBindings* const> prepared_bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
@@ -239,6 +242,12 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+
+	// The description of a texture binding, kept for inputs seen before.
+	[[nodiscard]] const TextureDescription&
+	FindTextureDescription(const ShaderRecompiler::IR::ImageResource&   resource,
+	                       const ShaderRecompiler::IR::DescriptorValue& value);
+
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -280,10 +289,25 @@ private:
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::unique_ptr<DeferredDrawQueue>    m_deferred;
 	uint32_t                              m_ops_since_submit = 0;
+	struct TextureDescriptionEntry {
+		ShaderRecompiler::IR::ImageResource   resource;
+		ShaderRecompiler::IR::DescriptorValue value;
+		TextureDescription                    description;
+	};
+	// Descriptions by input hash; an entry is used only when its inputs compare equal.
+	std::unordered_map<uint64_t, TextureDescriptionEntry> m_texture_descriptions;
+	std::vector<GuestRange>               m_write_ranges;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
 };
+
+// Sorts nonempty ranges and merges those that overlap or touch; exits on an empty or wrapping
+// range.
+void MergeGuestRanges(std::vector<GuestRange>& ranges);
+// True when a scalar read is invalid or overlaps one of the sorted, disjoint written ranges.
+[[nodiscard]] bool ScalarReadsMayOverlap(std::span<const std::pair<uint64_t, uint64_t>> reads,
+                                         std::span<const GuestRange>                    writes);
 
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,

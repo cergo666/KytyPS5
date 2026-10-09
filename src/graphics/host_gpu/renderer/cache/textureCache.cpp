@@ -37,6 +37,8 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+// Exact matches remembered by FindImage; more start the cache over.
+constexpr size_t MaxExactImages = 16384;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -225,6 +227,24 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	return true;
 }
 
+size_t TextureCache::ExactImageKeyHash::operator()(const ExactImageKey& key) const noexcept {
+	uint64_t   hash = 0xcbf29ce484222325ull;
+	const auto mix  = [&hash](uint64_t value) {
+		hash = (hash ^ value) * 0x100000001b3ull;
+		hash ^= hash >> 32u;
+	};
+	mix(key.data.address);
+	mix(key.data.size);
+	mix(key.extent.width | (uint64_t {key.extent.height} << 32u));
+	mix(key.extent.depth | (uint64_t {key.resources.levels} << 32u));
+	mix(key.resources.layers | (uint64_t {key.samples} << 32u));
+	mix(key.bytes_per_block | (uint64_t {static_cast<uint32_t>(key.tile_mode)} << 32u));
+	mix(static_cast<uint32_t>(key.transform) |
+	    (uint64_t {static_cast<uint32_t>(key.pixel_format)} << 32u));
+	mix(static_cast<uint32_t>(key.type) | (uint64_t {key.exact_format} << 32u));
+	return static_cast<size_t>(hash);
+}
+
 TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	if (image.info.IsDepth()) {
 		if (image.info.tile_mode == Prospero::TileMode::kDepth ||
@@ -250,6 +270,34 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+TextureCache::RegisteredPageCounts::~RegisteredPageCounts() {
+	for (auto& leaf: m_leaves) {
+		delete leaf.load(std::memory_order_relaxed);
+	}
+}
+
+void TextureCache::RegisteredPageCounts::Add(size_t page, int32_t delta) {
+	auto& slot = m_leaves[page >> kLeafBits];
+	auto* leaf = slot.load(std::memory_order_relaxed);
+	if (leaf == nullptr) {
+		leaf = new Leaf {};
+		slot.store(leaf, std::memory_order_release);
+	}
+	(*leaf)[page & (kLeafSize - 1)].fetch_add(static_cast<uint32_t>(delta),
+	                                          std::memory_order_release);
+}
+
+bool TextureCache::RegisteredPageCounts::Any(size_t first, size_t last_exclusive) const noexcept {
+	for (auto page = first; page < last_exclusive; page++) {
+		const auto* leaf = m_leaves[page >> kLeafBits].load(std::memory_order_acquire);
+		if (leaf != nullptr &&
+		    (*leaf)[page & (kLeafSize - 1)].load(std::memory_order_acquire) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
@@ -261,7 +309,9 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
+		m_registered_pages.Add(page, 1);
 	});
+	m_registration_generation++;
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_registered_memory += image.AccountedSize();
@@ -282,6 +332,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
+		m_registered_pages.Add(page, -1);
 	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -289,6 +340,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_registered_memory -= accounted;
+	m_registration_generation++;
 	image.registered = false;
 	++m_retirement_count;
 }
@@ -1597,14 +1649,32 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
+		const ExactImageKey key {desc.info.data,
+		                         desc.info.extent,
+		                         desc.info.resources,
+		                         desc.info.samples,
+		                         desc.info.bytes_per_block,
+		                         desc.info.tile_mode,
+		                         desc.info.GetColorTransform(),
+		                         desc.info.pixel_format,
+		                         desc.info.type,
+		                         exact_format};
+		const auto          exact = m_exact_images.find(key);
+		const bool          known =
+		    exact != m_exact_images.end() && exact->second.generation == m_registration_generation;
+		bool     exact_match = known;
+		ImageIds candidates;
+		if (known) {
+			result = exact->second.id;
+		} else {
+			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			for (const auto id: candidates) {
+				const auto& image = m_slot_images[id];
+				if (SameBacking(image.info, desc.info, exact_format)) {
+					result = id;
+				}
 			}
+			exact_match = static_cast<bool>(result);
 		}
 
 		int32_t view_mip   = -1;
@@ -1639,6 +1709,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
+			// Registered last on its pages, the new image is what an exact search finds next.
+			exact_match = true;
+		}
+		if (exact_match && !known) {
+			if (m_exact_images.size() >= MaxExactImages) {
+				m_exact_images.clear();
+			}
+			m_exact_images[key] = {result, m_registration_generation};
 		}
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {
@@ -1997,6 +2075,13 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	// Images register their pages before they are tracked, so CPU writes to pages without one
+	// have nothing to invalidate. Most write faults land there and need not wait for the lock.
+	ImagePageTable::PageRange pages {};
+	if (ImagePageTable::TryGetPageRange(address, size, pages) &&
+	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
+		return;
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
