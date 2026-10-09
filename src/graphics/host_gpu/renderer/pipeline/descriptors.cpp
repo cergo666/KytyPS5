@@ -536,9 +536,11 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+// Everything a texture binding needs before the cache lookup: a function of its inputs only.
+static TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                          const ShaderRecompiler::IR::DescriptorValue& value,
+                                          bool int64_atomics) {
+	if (resource.atomic64 && !int64_atomics) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
@@ -547,12 +549,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageImageResource(resource);
 	}
 
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		TextureDescription result {};
+		result.desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                : TextureCache::BindingType::Texture);
+		result.null = true;
+		return result;
 	}
 
 	const auto address         = descriptor.Base40();
@@ -693,10 +695,78 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	TextureDescription result {};
+	result.desc              = std::move(desc);
+	result.descriptor        = descriptor;
+	result.pixel_format      = pixel_format;
+	result.view_format       = view_format;
+	result.size              = size.size;
+	result.shader_conversion = shader_conversion;
+	return result;
+}
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
-	auto*      image               = &texture_cache.GetImage(id);
-	const bool stencil_association = static_cast<bool>(image->depth_id);
+static uint64_t TextureDescriptionKey(const ShaderRecompiler::IR::ImageResource&   resource,
+                                      const ShaderRecompiler::IR::DescriptorValue& value) {
+	uint64_t   hash = 0xcbf29ce484222325ull;
+	const auto mix  = [&hash](uint64_t word) {
+		hash = (hash ^ word) * 0x100000001b3ull;
+		hash ^= hash >> 32u;
+	};
+	for (uint32_t i = 0; i < value.dwords.size(); i += 2) {
+		mix(value.dwords[i] | (uint64_t {value.dwords[i + 1]} << 32u));
+	}
+	// Every compared field that tells two resources of the same descriptor apart.
+	mix(resource.source | (uint64_t {resource.first_use_pc} << 32u));
+	mix(resource.indirect_root | (uint64_t {resource.shader_swizzle} << 32u));
+	mix(static_cast<uint32_t>(resource.conversion_format) |
+	    (uint64_t {resource.indirect_mapping_offset} << 32u));
+	mix(value.dword_count | (uint64_t {static_cast<uint32_t>(resource.dimension)} << 32u));
+	mix(static_cast<uint32_t>(resource.resource_class) |
+	    (uint64_t {static_cast<uint32_t>(resource.numeric_class)} << 32u));
+	mix(static_cast<uint32_t>(resource.mip_mode) | (uint64_t {resource.mip_count} << 32u));
+	mix(uint64_t {resource.read} | (uint64_t {resource.written} << 8u) |
+	    (uint64_t {resource.atomic} << 16u) | (uint64_t {resource.atomic64} << 24u) |
+	    (uint64_t {resource.depth_compare} << 32u) | (uint64_t {resource.cube} << 40u) |
+	    (uint64_t {resource.r128} << 48u));
+	return hash;
+}
+
+const TextureDescription&
+RenderExecutor::FindTextureDescription(const ShaderRecompiler::IR::ImageResource&   resource,
+                                       const ShaderRecompiler::IR::DescriptorValue& value) {
+	constexpr size_t MaxTextureDescriptions = 16384;
+	const auto       key                    = TextureDescriptionKey(resource, value);
+	if (const auto found = m_texture_descriptions.find(key);
+	    found != m_texture_descriptions.end() && found->second.value == value &&
+	    found->second.resource == resource) {
+		return found->second.description;
+	}
+	if (m_texture_descriptions.size() >= MaxTextureDescriptions) {
+		m_texture_descriptions.clear();
+	}
+	auto& entry       = m_texture_descriptions[key];
+	entry.resource    = resource;
+	entry.value       = value;
+	entry.description = DescribeTexture(resource, value,
+	                                    m_context.GetGraphics().shader_image_int64_atomics_enabled);
+	return entry.description;
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	// A copy: the cache lookups below must not depend on the memo's storage.
+	auto  described     = FindTextureDescription(resource, value);
+	auto& desc          = described.desc;
+	auto& texture_cache = m_context.GetTextureCache();
+	if (described.null) {
+		const auto id = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+	const bool  storage             = resource.written;
+	const auto& descriptor          = described.descriptor;
+	auto        id                  = texture_cache.FindImage(desc, described.shader_conversion);
+	auto*       image               = &texture_cache.GetImage(id);
+	const bool  stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
@@ -704,11 +774,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, described.pixel_format,
+		                            described.size);
 	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+		ValidateStorageColorView(image->info.pixel_format, described.view_format,
+		                         descriptor.DstSelXYZW());
 	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		(void)SelectSampledColorView(image->info.pixel_format, described.pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};
@@ -976,6 +1048,70 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+void MergeGuestRanges(std::vector<GuestRange>& ranges) {
+	std::sort(ranges.begin(), ranges.end(),
+	          [](const GuestRange& a, const GuestRange& b) { return a.address < b.address; });
+	size_t merged = 0;
+	for (const auto range: ranges) {
+		if (range.size == 0 || range.address > UINT64_MAX - range.size) {
+			EXIT("invalid image overlap range\n");
+		}
+		if (merged != 0 && range.address <= ranges[merged - 1].End()) {
+			auto& last = ranges[merged - 1];
+			last.size  = std::max(last.End(), range.End()) - last.address;
+		} else {
+			ranges[merged++] = range;
+		}
+	}
+	ranges.resize(merged);
+}
+
+bool ScalarReadsMayOverlap(std::span<const std::pair<uint64_t, uint64_t>> reads,
+                           std::span<const GuestRange>                    writes) {
+	if (writes.empty()) {
+		return false;
+	}
+	for (const auto [address, size]: reads) {
+		if (size == 0 || address > UINT64_MAX - size) {
+			return true;
+		}
+		const auto next = std::upper_bound(
+		    writes.begin(), writes.end(), address,
+		    [](uint64_t value, const GuestRange& range) { return value < range.End(); });
+		if (next != writes.end() && next->address < address + size) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void RenderExecutor::GatherWriteRanges(std::span<PreparedBindings* const> prepared_bindings) {
+	m_write_ranges.clear();
+	for (const auto id: m_bound_images) {
+		const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+		if (image == nullptr || (!image->binding.shader_write && !image->binding.is_target)) {
+			continue;
+		}
+		for (const auto written:
+		     {image->info.data, image->info.stencil, image->info.metadata.range}) {
+			if (written.size != 0) {
+				m_write_ranges.push_back(written);
+			}
+		}
+	}
+	for (const auto* writer: prepared_bindings) {
+		const auto& program = *writer->runtime->program;
+		for (const auto& resource: program.info.buffers) {
+			if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+			const auto& written = writer->buffer_sources[resource.descriptor_index];
+			if (written.size != 0) {
+				m_write_ranges.push_back({written.address, written.size});
+			}
+		}
+	}
+	MergeGuestRanges(m_write_ranges);
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1012,33 +1148,31 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
-	{
-		// Scalar reads must be disjoint from everything the draw writes. Collect the written
-		// ranges once; each read is then checked against that short list instead of every
-		// bound image and buffer.
-		bool any_reads = false;
-		for (const auto* reader: prepared_bindings) {
-			any_reads |= !reader->runtime->resources->specialization_reads.empty();
-		}
-		if (any_reads) {
-			struct WrittenRange {
-				uint64_t address, size;
-				bool     image;
-			};
-			std::vector<WrittenRange> written_ranges;
-			for (const auto* writer: prepared_bindings) {
-				if (writer->runtime->program->has_address_writes) {
-					EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
-				}
+	bool writes_gathered = false;
+	for (const auto* reader: prepared_bindings) {
+		const auto& reads = reader->runtime->resources->specialization_reads;
+		if (reads.empty()) continue;
+		for (const auto* writer: prepared_bindings) {
+			if (writer->runtime->program->has_address_writes) {
+				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
+		}
+		if (!writes_gathered) {
+			writes_gathered = true;
+			GatherWriteRanges(prepared_bindings);
+		}
+		if (!ScalarReadsMayOverlap(reads, m_write_ranges)) continue;
+		// Name the overlapping write.
+		for (const auto [address, size]: reads) {
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0) {
-						written_ranges.push_back({written.address, written.size, true});
+					if (written.size != 0 && ImageRangeOverlaps(address, size,
+					                                          written.address, written.size)) {
+						EXIT("scalar resource reads overlap an image or attachment write\n");
 					}
 				}
 			}
@@ -1047,19 +1181,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				for (const auto& resource: program.info.buffers) {
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0) {
-						written_ranges.push_back({written.address, written.size, false});
-					}
-				}
-			}
-			for (const auto* reader: prepared_bindings) {
-				for (const auto [address, size]: reader->runtime->resources->specialization_reads) {
-					for (const auto& written: written_ranges) {
-						if (ImageRangeOverlaps(address, size, written.address, written.size)) {
-							EXIT(written.image
-							         ? "scalar resource reads overlap an image or attachment write\n"
-							         : "scalar resource reads overlap a shader buffer write\n");
-						}
+					if (written.size != 0 && ImageRangeOverlaps(address, size,
+					                                          written.address, written.size)) {
+						EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}
 			}
