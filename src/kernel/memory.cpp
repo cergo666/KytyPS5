@@ -2418,7 +2418,7 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 
 	if (len != 0 && (address == 0 || (address & (PRT_PAGE_SIZE - 1u)) != 0 ||
 	                 (len & (PRT_PAGE_SIZE - 1u)) != 0 || address < PRT_APERTURE_START ||
-	                 len > PRT_APERTURE_END - address)) {
+	                 address > PRT_APERTURE_END || len > PRT_APERTURE_END - address)) {
 		return KERNEL_ERROR_EINVAL;
 	}
 

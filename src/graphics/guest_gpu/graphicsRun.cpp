@@ -873,6 +873,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		// Every handler processes at most the packet's own declared length; reject a
+		// packet that claims to be longer than what's actually left in the command
+		// buffer before dispatch, so a handler can never read past the command span.
+		const auto declared_packet_dw = KYTY_PM4_LEN(packet_header);
+		EXIT_NOT_IMPLEMENTED(declared_packet_dw == 0 || declared_packet_dw > remaining_dw);
+
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);

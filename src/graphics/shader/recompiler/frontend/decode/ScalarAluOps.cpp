@@ -124,8 +124,8 @@ constexpr auto SOPP_OPS = Detail::MakeOpcodeTable<0x80>(SOPP_OPCODE_LIST);
 
 void DecodeBinarySources(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                          Instruction& inst, uint32_t ssrc0, uint32_t ssrc1) {
-	DecodeScalarSource(ssrc0, pc, inst.src0);
-	DecodeScalarSource(ssrc1, pc, inst.src1);
+	DecodeScalarSource(ssrc0, pc, inst, inst.src0);
+	DecodeScalarSource(ssrc1, pc, inst, inst.src1);
 	inst.src_count = 2;
 	ReadLiteralOperands(code, word_index, inst);
 }
@@ -157,19 +157,19 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	switch (inst.opcode) {
 		case Opcode::S_GETPC_B64:
 			inst.src_count = 0;
-			DecodeScalarDestination(sdst, pc, inst.dst);
+			DecodeScalarDestination(sdst, pc, inst, inst.dst);
 			return;
 		case Opcode::S_SETPC_B64:
 			inst.src_count = 1;
 			inst.dst.kind  = OperandKind::Null;
-			DecodeScalarSource(ssrc0, pc, inst.src0);
+			DecodeScalarSource(ssrc0, pc, inst, inst.src0);
 			ReadLiteralOperands(code, word_index, inst);
 			return;
 		default: break;
 	}
 
-	DecodeScalarSource(ssrc0, pc, inst.src0);
-	DecodeScalarDestination(sdst, pc, inst.dst);
+	DecodeScalarSource(ssrc0, pc, inst, inst.src0);
+	DecodeScalarDestination(sdst, pc, inst, inst.dst);
 	inst.src_count = 1;
 	ReadLiteralOperands(code, word_index, inst);
 }
@@ -193,7 +193,7 @@ void DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 
-	DecodeScalarDestination(sdst, pc, inst.dst);
+	DecodeScalarDestination(sdst, pc, inst, inst.dst);
 	DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1);
 }
 
@@ -222,10 +222,10 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	switch (inst.opcode) {
-		case Opcode::S_MOVK_I32: DecodeScalarDestination(sdst, pc, inst.dst); return;
+		case Opcode::S_MOVK_I32: DecodeScalarDestination(sdst, pc, inst, inst.dst); return;
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:
-			DecodeScalarDestination(sdst, pc, inst.dst);
+			DecodeScalarDestination(sdst, pc, inst, inst.dst);
 			inst.branch_target = pc + 4u + static_cast<uint32_t>(imm * 4);
 			return;
 		case Opcode::S_WAITCNT: {
@@ -241,7 +241,7 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			inst.src1           = inst.src0;
 			inst.src1.value     = word & 0xffffu;
 			inst.src1.signed_val = static_cast<int32_t>(inst.src1.value);
-			DecodeScalarSource(sdst, pc, inst.src0);
+			DecodeScalarSource(sdst, pc, inst, inst.src0);
 			inst.src_count = 2;
 			return;
 		case Opcode::S_SETREG_B32:
@@ -250,16 +250,16 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			inst.src1.value      = word & 0xffffu;
 			inst.src1.signed_val = static_cast<int32_t>(imm);
 			inst.src_count       = 2;
-			DecodeScalarSource(sdst, pc, inst.src0);
+			DecodeScalarSource(sdst, pc, inst, inst.src0);
 			return;
 		default: break;
 	}
 
 	inst.src1 = inst.src0;
-	DecodeScalarSource(sdst, pc, inst.src0);
+	DecodeScalarSource(sdst, pc, inst, inst.src0);
 	if (inst.opcode == Opcode::S_ADD_I32 || inst.opcode == Opcode::S_MULK_I32) {
 		inst.src_count = 2;
-		DecodeScalarDestination(sdst, pc, inst.dst);
+		DecodeScalarDestination(sdst, pc, inst, inst.dst);
 		return;
 	}
 

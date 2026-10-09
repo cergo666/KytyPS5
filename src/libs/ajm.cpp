@@ -448,9 +448,19 @@ static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer
 	size_t input_size  = 0;
 	size_t output_size = 0;
 	for (size_t i = 0; i < input_buffers_num && input_buffers != nullptr; i++) {
+		if (input_size + input_buffers[i].size < input_size) {
+			AjmDecodeResult result {};
+			result.result = AJM_RESULT_INVALID_PARAMETER;
+			return result;
+		}
 		input_size += input_buffers[i].size;
 	}
 	for (size_t i = 0; i < output_buffers_num && output_buffers != nullptr; i++) {
+		if (output_size + output_buffers[i].size < output_size) {
+			AjmDecodeResult result {};
+			result.result = AJM_RESULT_INVALID_PARAMETER;
+			return result;
+		}
 		output_size += output_buffers[i].size;
 	}
 

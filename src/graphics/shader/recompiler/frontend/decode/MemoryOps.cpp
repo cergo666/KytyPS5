@@ -260,15 +260,15 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		SetUnsupported(inst, Family::SMEM, opcode, "SMEM opcode is not implemented");
 	}
 
-	DecodeScalarDestination(sdst, pc, inst.dst);
+	DecodeScalarDestination(sdst, pc, inst, inst.dst);
 	if (inst.opcode == Opcode::S_MEMREALTIME) {
 		inst.src_count = 0;
 		return;
 	}
 	// SMEM encodes SBASE in SGPR pairs. Scalar-buffer loads still use the same
 	// pair index; their descriptor operand consumes four SGPRs from that base.
-	DecodeScalarSource(sbase * 2u, pc, inst.src0);
-	DecodeScalarSource(soffset, pc, inst.src1);
+	DecodeScalarSource(sbase * 2u, pc, inst, inst.src0);
+	DecodeScalarSource(soffset, pc, inst, inst.src1);
 	inst.src_count = 2;
 }
 
@@ -306,8 +306,8 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 		inst.dst.sdwa_sel = inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI ? 5u : 4u;
 	}
 	DecodeVectorGpr(vaddr, inst.src0);
-	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
-	DecodeScalarSource(soffset, pc, inst.src2);
+	DecodeScalarSource(srsrc * 4u, pc, inst, inst.src1);
+	DecodeScalarSource(soffset, pc, inst, inst.src2);
 	inst.src_count = 3;
 }
 
@@ -344,8 +344,8 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 
 	DecodeVectorGpr(vdata, inst.dst);
 	DecodeVectorGpr(vaddr, inst.src0);
-	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
-	DecodeScalarSource(soffset, pc, inst.src2);
+	DecodeScalarSource(srsrc * 4u, pc, inst, inst.src1);
+	DecodeScalarSource(soffset, pc, inst, inst.src2);
 	inst.src_count = 3;
 }
 
@@ -395,7 +395,7 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		DecodeVectorGpr(addr + 1u, inst.src1);
 		inst.src_count = 2;
 	} else {
-		DecodeScalarSource(saddr, pc, inst.src1);
+		DecodeScalarSource(saddr, pc, inst, inst.src1);
 		inst.src_count = 2;
 	}
 }

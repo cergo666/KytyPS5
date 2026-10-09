@@ -373,10 +373,36 @@ enum class Opcode {
 	V_CMP_NEQ_F32,
 	V_CMP_NLT_F32,
 	V_CMP_TRU_F32,
+	V_CMP_F_F64,
+	V_CMP_LT_F64,
 	V_CMP_EQ_F64,
 	V_CMP_LE_F64,
+	V_CMP_GT_F64,
+	V_CMP_LG_F64,
+	V_CMP_GE_F64,
+	V_CMP_O_F64,
+	V_CMP_U_F64,
+	V_CMP_NGE_F64,
+	V_CMP_NLG_F64,
+	V_CMP_NGT_F64,
+	V_CMP_NLE_F64,
+	V_CMP_NEQ_F64,
+	V_CMP_NLT_F64,
+	V_CMP_TRU_F64,
+	V_CMPX_LT_F64,
+	V_CMPX_EQ_F64,
 	V_CMPX_LE_F64,
+	V_CMPX_GT_F64,
+	V_CMPX_LG_F64,
 	V_CMPX_GE_F64,
+	V_CMPX_O_F64,
+	V_CMPX_U_F64,
+	V_CMPX_NGE_F64,
+	V_CMPX_NLG_F64,
+	V_CMPX_NGT_F64,
+	V_CMPX_NLE_F64,
+	V_CMPX_NEQ_F64,
+	V_CMPX_NLT_F64,
 	V_CMPX_LT_F32,
 	V_CMPX_EQ_F32,
 	V_CMPX_LE_F32,
@@ -827,8 +853,8 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program);
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 
-void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
-void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);
+void DecodeScalarSource(uint32_t code, uint32_t pc, Instruction& inst, Operand& operand);
+void DecodeScalarDestination(uint32_t code, uint32_t pc, Instruction& inst, Operand& operand);
 void DecodeVectorGpr(uint32_t reg, Operand& operand);
 void ReadLiteralOperands(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t word_index,

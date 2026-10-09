@@ -26298,7 +26298,13 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
       Compare{0xf1, O::V_CMPX_LT_U64, 1}, Compare{0xf2, O::V_CMPX_EQ_U64, 1},
       Compare{0xf3, O::V_CMPX_LE_U64, 1}, Compare{0xf4, O::V_CMPX_GT_U64, 1},
       Compare{0xf6, O::V_CMPX_GE_U64, 1}, Compare{0xf7, O::V_CMPX_T_U64, 1},
-      Compare{0x33, O::V_CMPX_LE_F64, 2}, Compare{0x36, O::V_CMPX_GE_F64, 2}};
+      Compare{0x33, O::V_CMPX_LE_F64, 2}, Compare{0x36, O::V_CMPX_GE_F64, 2},
+      Compare{0x31, O::V_CMPX_LT_F64, 2}, Compare{0x32, O::V_CMPX_EQ_F64, 2},
+      Compare{0x34, O::V_CMPX_GT_F64, 2}, Compare{0x35, O::V_CMPX_LG_F64, 2},
+      Compare{0x37, O::V_CMPX_O_F64, 2},  Compare{0x38, O::V_CMPX_U_F64, 2},
+      Compare{0x39, O::V_CMPX_NGE_F64, 2}, Compare{0x3a, O::V_CMPX_NLG_F64, 2},
+      Compare{0x3b, O::V_CMPX_NGT_F64, 2}, Compare{0x3c, O::V_CMPX_NLE_F64, 2},
+      Compare{0x3d, O::V_CMPX_NEQ_F64, 2}, Compare{0x3e, O::V_CMPX_NLT_F64, 2}};
   constexpr u32 low_exec = 0xeeeeeeeeu, high_exec = 0x77777777u;
   constexpr u32 vcc_lo = 0x12345678u, vcc_hi = 0x89abcdefu;
   TestCase test;
@@ -26345,6 +26351,36 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
         case 0xf6: result = pair[0] >= pair[1]; break;
         case 0x33: result = std::bit_cast<double>(pair[0]) <= std::bit_cast<double>(pair[1]); break;
         case 0x36: result = std::bit_cast<double>(pair[0]) >= std::bit_cast<double>(pair[1]); break;
+        case 0x31: result = std::bit_cast<double>(pair[0]) < std::bit_cast<double>(pair[1]); break;
+        case 0x32: result = std::bit_cast<double>(pair[0]) == std::bit_cast<double>(pair[1]); break;
+        case 0x34: result = std::bit_cast<double>(pair[0]) > std::bit_cast<double>(pair[1]); break;
+        case 0x35: {
+          const auto lhs = std::bit_cast<double>(pair[0]);
+          const auto rhs = std::bit_cast<double>(pair[1]);
+          result         = lhs < rhs || lhs > rhs; // ordered "<>": false if either is NaN.
+          break;
+        }
+        case 0x37:
+          result = !std::isnan(std::bit_cast<double>(pair[0])) &&
+                    !std::isnan(std::bit_cast<double>(pair[1]));
+          break;
+        case 0x38:
+          result = std::isnan(std::bit_cast<double>(pair[0])) ||
+                    std::isnan(std::bit_cast<double>(pair[1]));
+          break;
+        // The N* predicates are the logical negation of their ordered counterpart,
+        // which is true for any comparison involving a NaN (IEEE unordered compares).
+        case 0x39: result = !(std::bit_cast<double>(pair[0]) >= std::bit_cast<double>(pair[1])); break;
+        case 0x3a: {
+          const auto lhs = std::bit_cast<double>(pair[0]);
+          const auto rhs = std::bit_cast<double>(pair[1]);
+          result         = !(lhs < rhs || lhs > rhs);
+          break;
+        }
+        case 0x3b: result = !(std::bit_cast<double>(pair[0]) > std::bit_cast<double>(pair[1])); break;
+        case 0x3c: result = !(std::bit_cast<double>(pair[0]) <= std::bit_cast<double>(pair[1])); break;
+        case 0x3d: result = !(std::bit_cast<double>(pair[0]) == std::bit_cast<double>(pair[1])); break;
+        case 0x3e: result = !(std::bit_cast<double>(pair[0]) < std::bit_cast<double>(pair[1])); break;
       }
       if (result) expected_exec[lane / 32] |= 1u << (lane % 32);
     }
@@ -26377,7 +26413,10 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
   test.opcodes.insert(test.opcodes.end(), {O::V_MOV_B32, O::S_MOV_B32, O::S_MOV_B64,
       O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
       O::BUFFER_STORE_DWORD, O::S_ENDPGM});
-  test.required_spirv = {"OpFOrdLessThanEqual", "OpFOrdGreaterThanEqual"};
+  test.required_spirv = {"OpFOrdLessThanEqual", "OpFOrdGreaterThanEqual", "OpFOrdLessThan",
+                         "OpFOrdGreaterThan",   "OpFOrdEqual",           "OpFOrdNotEqual",
+                         "OpFUnordEqual",       "OpFUnordNotEqual",      "OpFUnordLessThan",
+                         "OpFUnordGreaterThan", "OpFUnordLessThanEqual", "OpFUnordGreaterThanEqual"};
   return test;
 }
 
@@ -26414,6 +26453,18 @@ TestCase VectorCompareF64Edges() {
     store_mask(106, lhs == rhs);
     test.code.push_back(EncodeVopc(0x23, Vgpr(1), 3));
     store_mask(106, lhs <= rhs);
+    test.code.push_back(EncodeVopc(0x21, Vgpr(1), 3));
+    store_mask(106, lhs < rhs);
+    test.code.push_back(EncodeVopc(0x24, Vgpr(1), 3));
+    store_mask(106, lhs > rhs);
+    test.code.push_back(EncodeVopc(0x25, Vgpr(1), 3));
+    store_mask(106, lhs < rhs || lhs > rhs); // ordered "<>": false if either is NaN.
+    test.code.push_back(EncodeVopc(0x27, Vgpr(1), 3));
+    store_mask(106, !std::isnan(lhs) && !std::isnan(rhs));
+    test.code.push_back(EncodeVopc(0x28, Vgpr(1), 3));
+    store_mask(106, std::isnan(lhs) || std::isnan(rhs));
+    test.code.push_back(EncodeVopc(0x2du, Vgpr(1), 3));
+    store_mask(106, !(lhs == rhs)); // NEQ: unordered-or-not-equal.
     AppendVop3(&test.code, 0x23, 20, Vgpr(1), Vgpr(3), 0, 1, 0, false, 0, 1);
     store_mask(20, -std::abs(lhs) <= rhs);
     test.code.push_back(EncodeVopc(0x23, 255, 3));
@@ -26434,9 +26485,12 @@ TestCase VectorCompareF64Edges() {
   AppendEnd(&test.code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
-                  O::V_CMP_EQ_F64, O::V_CMP_LE_F64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "OpFOrdEqual",
-                         "OpFOrdLessThanEqual"};
+                  O::V_CMP_EQ_F64, O::V_CMP_LE_F64, O::V_CMP_LT_F64, O::V_CMP_GT_F64,
+                  O::V_CMP_LG_F64, O::V_CMP_O_F64, O::V_CMP_U_F64, O::V_CMP_NEQ_F64,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64",   "OpFOrdEqual",
+                         "OpFOrdLessThanEqual",  "OpFOrdLessThan",   "OpFOrdGreaterThan",
+                         "OpFOrdNotEqual",       "OpFUnordNotEqual"};
   return test;
 }
 

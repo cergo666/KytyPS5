@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/decode/ExportOps.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/frontend/decode/MemoryOps.h"
@@ -216,7 +217,7 @@ const char* ImageDimensionToString(ImageDimension dimension) {
 	}
 }
 
-void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
+void DecodeScalarSource(uint32_t code, uint32_t pc, Instruction& inst, Operand& operand) {
 	operand = {};
 
 	if (code <= 105u) {
@@ -265,11 +266,17 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 252u: operand.kind = OperandKind::ExecZ; return;
 		case 253u: operand.kind = OperandKind::Scc; return;
 		case 255u: operand.kind = OperandKind::LiteralConstant; return;
-		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			// Rare/reserved scalar operand codes (e.g. trap-temp registers) are not
+			// decoded. Mark the whole instruction unsupported right away: an
+			// Unknown operand left unchecked would otherwise reach a reader that
+			// aborts the emulator instead of degrading gracefully.
+			SetUnsupported(inst, inst.family, inst.opcode_id, "unsupported scalar source operand");
+			operand.kind = OperandKind::Unknown;
 	}
 }
 
-void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
+void DecodeScalarDestination(uint32_t code, uint32_t pc, Instruction& inst, Operand& operand) {
 	operand = {};
 
 	if (code <= 105u) {
@@ -285,7 +292,10 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 		case 125u: operand.kind = OperandKind::Null; return;
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
-		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			SetUnsupported(inst, inst.family, inst.opcode_id,
+			               "unsupported scalar destination operand");
+			operand.kind = OperandKind::Unknown;
 	}
 }
 
