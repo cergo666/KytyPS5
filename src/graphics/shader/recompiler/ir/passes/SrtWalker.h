@@ -27,7 +27,7 @@ struct SrtReadFlags {
 	uint32_t clean = 0;
 };
 
-enum class RuntimeValueType { Any, Integer };
+enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
