@@ -29,8 +29,11 @@ public:
 
 	void               Shutdown();
 	[[nodiscard]] bool IsStopping();
-	void               SendCommand(Common::UniqueFunction<void>&& command);
-	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	void               SendCommand(Common::UniqueFunction<void>&& command, bool ordered = true);
+	// `ordered` commands run only after every draw the command processor has already decoded;
+	// unordered ones (reads of GPU-written memory for guest faults) may run before deferred
+	// draws, which the guest cannot have seen executed yet.
+	void               SendCommandSync(Common::UniqueFunction<void>&& command, bool ordered = true);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,
@@ -46,6 +49,9 @@ public:
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 	[[nodiscard]] bool        HasPendingCommands() const noexcept {
 		return m_pending_commands.load(std::memory_order_acquire) != 0;
+	}
+	[[nodiscard]] bool HasPendingOrderedCommands() const noexcept {
+		return m_pending_ordered.load(std::memory_order_acquire) != 0;
 	}
 
 private:
@@ -85,6 +91,8 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::atomic_uint32_t                           m_pending_ordered {0};
+	std::deque<bool>                               m_command_ordered;
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

@@ -105,7 +105,7 @@ bool GuestGpu::IsStopping() {
 	return m_stopping;
 }
 
-void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
+void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command, bool ordered) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
 		command();
@@ -114,6 +114,10 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
+	m_command_ordered.push_back(ordered);
+	if (ordered) {
+		m_pending_ordered.fetch_add(1, std::memory_order_release);
+	}
 	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
 }
@@ -127,23 +131,29 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_commands.empty());
 			command = std::move(m_commands.front());
 			m_commands.pop_front();
+			if (m_command_ordered.front()) {
+				m_pending_ordered.fetch_sub(1, std::memory_order_acq_rel);
+			}
+			m_command_ordered.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
 		command();
 	}
 }
 
-void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
+void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command, bool ordered) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
 		command();
 		return;
 	}
 	std::binary_semaphore done {0};
-	SendCommand([operation = std::move(command), &done]() mutable {
-		operation();
-		done.release();
-	});
+	SendCommand(
+	    [operation = std::move(command), &done]() mutable {
+		    operation();
+		    done.release();
+	    },
+	    ordered);
 	done.acquire();
 }
 
@@ -489,6 +499,10 @@ void GuestGpu::ThreadRun(void* data) {
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
+				if (gpu->m_command_ordered.front()) {
+					gpu->m_pending_ordered.fetch_sub(1, std::memory_order_acq_rel);
+				}
+				gpu->m_command_ordered.pop_front();
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
@@ -604,6 +618,9 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+/// Advance a submission, retaining command-execution state when processing suspends.
+/// Return whether it completed. Suspend-point notification waits for its GPU tick
+/// but only releases a host semaphore, so it does not retain guest-memory ownership.
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
@@ -686,7 +703,7 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			    [ready = m_suspend_point_ready] { ready->release(); }, GuestRange {});
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -789,7 +806,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	auto& executor = m_renderer.GetRenderExecutor();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
-			if (g_gpu_state->HasPendingCommands()) {
+			if (g_gpu_state->HasPendingOrderedCommands()) {
 				// Queued renderer commands (for example memory unmaps) are ordered after every
 				// draw already decoded.
 				executor.FlushDeferredDraws();
@@ -1610,6 +1627,8 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	GetScheduler().Flush();
 }
 
+/// Prepare a CPU-requested flip outside an existing command-processor scope and flush it.
+/// The deferred completion owns only host flip state; it does not dereference guest memory.
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	auto& command = CurrentBuffer();
 	if (g_current_processor != nullptr) {
@@ -1623,7 +1642,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
-	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, GuestRange {});
 	GetScheduler().Flush();
 }
 

@@ -19,6 +19,10 @@ void Install(GraphicContext& graphics);
 void EnableForThisThread();
 // Waits until everything queued so far has reached the driver. Any thread; a no-op when idle.
 void Drain();
+// Turns deferral off (false) or back on for the calling thread and returns the previous state.
+// For work recorded and submitted independently of the deferred stream (readback copies on
+// their own queue), which must not wait for the ring to drain.
+bool SetDeferral(bool enabled);
 [[nodiscard]] bool Enabled();
 
 } // namespace Libs::Graphics::VkRecorder

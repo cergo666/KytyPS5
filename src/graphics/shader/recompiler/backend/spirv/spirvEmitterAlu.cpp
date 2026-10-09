@@ -217,7 +217,10 @@ uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1)
 }
 
 uint32_t EmitFPSaturate32(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450FClamp,
+	// The clamp output modifier maps NaN to 0 with DX10_CLAMP, which shaders use to scrub NaN
+	// (HLSL saturate); FClamp leaves NaN undefined and NVIDIA passes it on. NClamp returns 0
+	// (as shadPS4 #5257 does).
+	return EmitExt(state, TypeF32(state), GLSLstd450NClamp,
 	               {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
 }
 
