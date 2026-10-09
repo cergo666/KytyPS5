@@ -84,15 +84,10 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 	F32Class cls;
-	cls.bits                 = bits;
-	const auto abs_bits      = EmitAndConstant(state, cls.bits, 0x7fffffffu);
-	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
-	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
-	const auto exponent_max =
-	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0x7f800000u);
-	const auto mantissa_nonzero = EmitCompareU32Constant(state, spv::OpINotEqual, mantissa_bits, 0);
-	cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
-	cls.zero                    = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
+	cls.bits            = bits;
+	const auto abs_bits = EmitAndConstant(state, cls.bits, 0x7fffffffu);
+	cls.nan  = EmitCompareU32Constant(state, spv::OpUGreaterThan, abs_bits, 0x7f800000u);
+	cls.zero = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
 	return cls;
 }
 
