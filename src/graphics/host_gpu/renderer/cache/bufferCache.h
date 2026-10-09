@@ -192,6 +192,15 @@ private:
 	RangeSet                                          m_pending_writes;
 	uint64_t                                          m_unsubmitted_tick   = 0;
 	uint64_t                                          m_address_write_tick = 0;
+	// KYTY_DIAG_READBACK=1: recent GPU writes with the tick that recorded them, to report
+	// whether synchronous readbacks wait for work that is still running.
+	struct WriteTick {
+		uint64_t begin = 0, end = 0, tick = 0;
+	};
+	std::vector<WriteTick> m_write_ticks;
+	[[nodiscard]] uint64_t LastWriteTick(uint64_t begin, uint64_t end) const;
+	void ReportReadback(uint64_t writer_tick, bool writer_done, uint64_t bytes, bool detached,
+	                    uint64_t elapsed_ns);
 	struct KnownFill {
 		uint64_t address = 0, size = 0;
 		uint32_t value = 0;

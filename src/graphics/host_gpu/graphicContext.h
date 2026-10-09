@@ -50,6 +50,12 @@ struct GraphicContext {
 	vk::Queue     present_queue = nullptr;
 	Common::Mutex present_queue_mutex;
 	uint32_t      present_queue_index = 0;
+	// A queue of the renderer's family for synchronous readbacks: their copies wait only for the
+	// submission that wrote the data, not for everything queued before them. Null when absent
+	// or disabled (KYTY_SIDE_READBACK=0).
+	vk::Queue     readback_queue = nullptr;
+	Common::Mutex readback_queue_mutex;
+	uint32_t      readback_queue_index = 0;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

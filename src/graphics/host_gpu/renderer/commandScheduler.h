@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <optional>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -35,11 +36,14 @@ public:
 	// Records a small command buffer that runs behind all submitted work and waits for it. The
 	// current command buffer stays open and the tick timeline does not advance. Its pool is not
 	// shared: call it only from the thread that records the current command buffer.
+	// With `writer_tick` and a readback queue, the copy runs there instead and waits only for
+	// that tick of the master timeline (0: nothing to wait for).
 	template <typename Record>
-	void SubmitDetached(Record&& record) {
+	void SubmitDetached(Record&& record, std::optional<uint64_t> writer_tick = std::nullopt) {
 		record(BeginDetached());
-		EndDetached();
+		EndDetached(writer_tick);
 	}
+	[[nodiscard]] bool HasReadbackQueue() const noexcept;
 	// Work that runs after everything already submitted but ahead of the recording command
 	// buffer. BeginAhead returns a recording buffer; SubmitAheadAndWait runs it and blocks.
 	[[nodiscard]] vk::CommandBuffer BeginAhead();
@@ -101,7 +105,7 @@ private:
 
 	void              BeginNext();
 	vk::CommandBuffer BeginDetached();
-	void              EndDetached();
+	void              EndDetached(std::optional<uint64_t> writer_tick);
 	void              PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);

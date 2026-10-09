@@ -143,10 +143,35 @@ vk::CommandBuffer CommandScheduler::BeginDetached() {
 	return m_detached_command;
 }
 
-void CommandScheduler::EndDetached() {
+bool CommandScheduler::HasReadbackQueue() const noexcept {
+	return m_graphics.readback_queue != nullptr;
+}
+
+void CommandScheduler::EndDetached(std::optional<uint64_t> writer_tick) {
 	EXIT_NOT_IMPLEMENTED(m_detached_command.end() != vk::Result::eSuccess);
 	vk::Result result;
-	{
+	const bool side = writer_tick.has_value() && m_graphics.readback_queue != nullptr;
+	if (side) {
+		// The timeline wait makes the writer's commands visible to the copy on this queue.
+		const uint64_t                  wait_value = *writer_tick;
+		const auto                      semaphore  = m_master.Handle();
+		const vk::PipelineStageFlags    stage      = vk::PipelineStageFlagBits::eAllCommands;
+		vk::TimelineSemaphoreSubmitInfo timeline {};
+		timeline.waitSemaphoreValueCount = 1;
+		timeline.pWaitSemaphoreValues    = &wait_value;
+		vk::SubmitInfo submit_info {};
+		submit_info.pNext              = &timeline;
+		submit_info.waitSemaphoreCount = wait_value != 0 ? 1u : 0u;
+		submit_info.pWaitSemaphores    = &semaphore;
+		submit_info.pWaitDstStageMask  = &stage;
+		if (wait_value == 0) {
+			submit_info.pNext = nullptr;
+		}
+		submit_info.commandBufferCount = 1;
+		submit_info.pCommandBuffers    = &m_detached_command;
+		Common::LockGuard lock(m_graphics.readback_queue_mutex);
+		result = m_graphics.readback_queue.submit(1, &submit_info, m_detached_fence);
+	} else {
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		vk::SubmitInfo    submit_info {};
 		submit_info.commandBufferCount = 1;

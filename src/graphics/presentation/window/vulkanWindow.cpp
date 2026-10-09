@@ -432,14 +432,22 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const std::array queue_priorities {1.0f, 1.0f};
+	const std::array queue_priorities {1.0f, 1.0f, 1.0f};
 	const auto       queue_families = physical_device.getQueueFamilyProperties();
 	graphics.present_queue_index =
 	    Config::DlssFrameGenerationEnabled() && queue_families[queue_family].queueCount > 1 ? 1u
 	                                                                                        : 0u;
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = graphics.present_queue_index + 1;
+	{
+		const char* env          = std::getenv("KYTY_SIDE_READBACK");
+		const bool  side_enabled = env == nullptr || env[0] != '0';
+		const auto  index        = graphics.present_queue_index + 1;
+		graphics.readback_queue_index =
+		    side_enabled && queue_families[queue_family].queueCount > index ? index : 0u;
+	}
+	queue_create_info.queueCount =
+	    std::max(graphics.present_queue_index, graphics.readback_queue_index) + 1;
 	queue_create_info.pQueuePriorities = queue_priorities.data();
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
@@ -1126,6 +1134,11 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.present_queue_index,
 	                            &graphic_ctx.present_queue);
+	if (graphic_ctx.readback_queue_index != 0) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.readback_queue_index,
+		                            &graphic_ctx.readback_queue);
+		std::printf("Readbacks: separate queue %u\n", graphic_ctx.readback_queue_index);
+	}
 	frame_generation->OnDevice(graphic_ctx);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	Checkpoint::g_queue = graphic_ctx.queue;
