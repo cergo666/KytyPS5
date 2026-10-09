@@ -230,6 +230,39 @@ struct PipelineCache::ProgramCache {
 			permutations.reserve(8);
 		}
 
+		std::span<const uint32_t> FunctionCode() const {
+			return call_source
+			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
+			    : std::span<const uint32_t>{};
+		}
+
+		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			const auto revision = call_source->revision;
+			ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
+			resource_plan.source_reads = call_source->reads;
+			return revision != call_source->revision;
+		}
+
+		template <bool HasCalls>
+		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                             uint32_t push_data_cursor) {
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, runtime, resources, specialization));
+			for (auto& candidate: permutations) {
+				const auto& layout = candidate.program.bindings;
+				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
+				        push_data_cursor, layout.ShaderDataDwords()) ||
+				    candidate.specialization != specialization) {
+					continue;
+				}
+				if constexpr (HasCalls) {
+					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+				}
+				return &candidate;
+			}
+			return nullptr;
+		}
+
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
@@ -313,31 +346,16 @@ struct PipelineCache::ProgramCache {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
 		bool source_changed = false;
-		const auto function_code = [](const std::unique_ptr<ShaderRecompiler::ShaderSource>& source) {
-			return source ? std::span<const uint32_t>(source->linked->code).subspan(source->code.size())
-			                     : std::span<const uint32_t>{};
-		};
-		if (entry != programs.end() && entry->second.call_source) {
+		if (entry != programs.end()) {
 			auto& cached = entry->second;
-			const auto revision = cached.call_source->revision;
-			ShaderRecompiler::RefreshShaderSource(*cached.call_source, runtime);
-			source_changed = revision != cached.call_source->revision;
-			cached.resource_plan.source_reads = cached.call_source->reads;
-		}
-		const auto matches = [&](const Permutation& candidate) {
-			const auto& layout = candidate.program.bindings;
-			return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
-			           push_data_cursor, layout.ShaderDataDwords()) &&
-			       candidate.specialization == entry->second.specialization &&
-			       (!entry->second.call_source || std::ranges::equal(
-			           candidate.function_code, function_code(entry->second.call_source)));
-		};
-		if (entry != programs.end() && !source_changed) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
-			if (const auto permutation = std::ranges::find_if(entry->second.permutations, matches);
-			    permutation != entry->second.permutations.end()) {
+			Permutation* permutation = nullptr;
+			if (cached.call_source) {
+				source_changed = cached.RefreshCallSource(runtime);
+				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
+			} else {
+				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+			}
+			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
@@ -390,11 +408,13 @@ struct PipelineCache::ProgramCache {
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr) {
-			const auto& decoded = entry == programs.end()
-			    ? ShaderRecompiler::RefreshShaderSource(*current, runtime)
-			    : current->linked->decoded;
-			translated = ShaderRecompiler::TranslateProgram(decoded, options);
-			translated.program.source_reads = current->reads;
+			if (current->call) {
+				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+				translated.program.source_reads = current->reads;
+			} else {
+				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+			}
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
@@ -407,11 +427,7 @@ struct PipelineCache::ProgramCache {
 			    entry->second.specialization));
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
-			if (const auto permutation = std::ranges::find_if(entry->second.permutations, matches);
-			    permutation != entry->second.permutations.end()) {
+			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
@@ -419,7 +435,7 @@ struct PipelineCache::ProgramCache {
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
-		    function_code(entry->second.call_source)));
+		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
