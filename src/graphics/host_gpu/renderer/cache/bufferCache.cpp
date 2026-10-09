@@ -162,6 +162,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+static uint64_t g_readback_copy_ns = 0, g_readback_order_ns = 0, g_readback_publish_ns = 0;
+
 static bool ReadbackDiagEnabled() {
 	static const bool enabled = [] {
 		const char* env = std::getenv("KYTY_DIAG_READBACK");
@@ -170,6 +172,10 @@ static bool ReadbackDiagEnabled() {
 	return enabled;
 }
 
+/// Download tracked GPU-dirty spans; return false when no copies are needed.
+/// Async publication retains temporary staging storage and declares the whole source
+/// buffer as a conservative hazard covering all packed copies. Synchronous publication
+/// waits for the GPU and earlier priority callbacks before writing guest backing.
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
@@ -184,7 +190,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			total_size += Common::AlignUp(end - start, 64);
 		});
 		m_gpu_modified_ranges.Subtract(address, bytes);
-		m_gpu_dirty_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
+		LogDirtyClear(address, address + bytes);
 	};
 	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size, gather);
 	if (copies.empty()) {
@@ -303,6 +309,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		command.EndRendering();
 		record(command.Handle());
 	}
+	// The guest ranges this download publishes (copies move into the publish step below).
+	std::vector<GuestRange> published;
+	published.reserve(copies.size());
+	for (const auto& copy: copies) {
+		published.push_back({buffer_address + copy.srcOffset, copy.size});
+	}
 	auto publish = [this, mapped, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
@@ -312,17 +324,39 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(std::move(publish),
+		                                   GuestRange {buffer_address, buffer.Size()});
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
+		const auto copied = std::chrono::steady_clock::now();
 		if (detached) {
-			// Nothing is deferred at the current tick: older publications go first, as below.
-			m_scheduler.WaitPriorityOperations(tick - 1);
+			// Nothing is deferred at the current tick. Older publications of these bytes go first;
+			// unrelated ones (labels, flips, other downloads) need not be waited for.
+			// KYTY_WAIT_ALL_PUBLICATIONS=1 waits for every older one, as before.
+			static const bool wait_all = [] {
+				const char* env = std::getenv("KYTY_WAIT_ALL_PUBLICATIONS");
+				return env != nullptr && env[0] == '1';
+			}();
+			if (wait_all) {
+				m_scheduler.WaitPriorityOperations(tick - 1);
+			} else {
+				m_scheduler.WaitPriorityOperations(tick - 1, published);
+			}
 		} else {
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
 		}
+		const auto ordered = std::chrono::steady_clock::now();
 		publish();
+		if (ReadbackDiagEnabled()) {
+			const auto ns = [](auto a, auto b) {
+				return static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+			};
+			g_readback_copy_ns += ns(readback_begin, copied);
+			g_readback_order_ns += ns(copied, ordered);
+			g_readback_publish_ns += ns(ordered, std::chrono::steady_clock::now());
+		}
 		// The caller releases the requested range; the neighbours are released here.
 		for (const auto& [address, bytes]: neighbours) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(address, bytes);
@@ -386,6 +420,12 @@ void BufferCache::ReportReadback(uint64_t writer_tick, bool writer_done, uint64_
 		            count ? static_cast<double>(total_ns) / count / 1e6 : 0.0,
 		            static_cast<unsigned long long>(count ? total_bytes / count : 0),
 		            count > unknown ? static_cast<double>(distance) / (count - unknown) : 0.0);
+		std::printf("[Readback]   copy+fence=%.2f ms  wait_older_publications=%.2f ms  "
+		            "publish=%.2f ms (averages)\n",
+		            count ? static_cast<double>(g_readback_copy_ns) / count / 1e6 : 0.0,
+		            count ? static_cast<double>(g_readback_order_ns) / count / 1e6 : 0.0,
+		            count ? static_cast<double>(g_readback_publish_ns) / count / 1e6 : 0.0);
+		g_readback_copy_ns = g_readback_order_ns = g_readback_publish_ns = 0;
 		std::fflush(stdout);
 		count = done = unknown = total_bytes = total_ns = distance = detached_count = 0;
 		last_print = now;
@@ -673,7 +713,7 @@ bool BufferCache::TryResolveKnownFill(uint64_t vaddr, uint64_t size) {
 			    ranges.emplace_back(start, end);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
-		    m_gpu_dirty_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
+		    LogDirtyClear(address, address + bytes);
 	    });
 	std::vector<uint8_t> bytes;
 	for (const auto& [start, end]: ranges) {
@@ -695,6 +735,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	// A read for a guest fault may run before the deferred draws: the guest cannot have seen
+	// them executed, so it has no claim on their writes. KYTY_FAULT_FLUSH=1 orders it after them.
+	static const bool fault_flush = [] {
+		const char* env = std::getenv("KYTY_FAULT_FLUSH");
+		return env != nullptr && env[0] == '1';
+	}();
+	const bool ordered = is_write || fault_flush;
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write]() mutable {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
@@ -709,7 +756,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
-	});
+	}, ordered);
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {

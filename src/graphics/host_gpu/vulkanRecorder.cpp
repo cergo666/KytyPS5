@@ -99,6 +99,8 @@ bool                   g_enabled = false;
 thread_local bool      t_defer   = false;
 // Serialises VkQueue access between the recorder thread and threads that submit directly.
 std::mutex             g_queue_mutex;
+// Submissions to this queue (readback copies) do not depend on deferred work: no drain.
+VkQueue                g_independent_queue = VK_NULL_HANDLE;
 
 // ------------------------------------------------------------------------------------------------
 // Single-producer (guest GPU thread) / single-consumer (recorder thread) ring of variable-size
@@ -1008,7 +1010,9 @@ VkResult VKAPI_CALL WrapQueueSubmit(VkQueue queue, uint32_t count, const VkSubmi
 	}
 	if (!t_defer || !supported) {
 		// Work this thread submits may wait for the guest GPU thread's queued submissions.
-		Drain();
+		if (t_defer || queue != g_independent_queue) {
+			Drain();
+		}
 		std::lock_guard lock(g_queue_mutex);
 		return g_real.vkQueueSubmit(queue, count, submits, fence);
 	}
@@ -1087,6 +1091,12 @@ void EnableForThisThread() {
 	t_defer = g_enabled;
 }
 
+bool SetDeferral(bool enabled) {
+	const bool previous = t_defer;
+	t_defer             = enabled && g_enabled;
+	return previous;
+}
+
 void Drain() {
 	if (!g_enabled) {
 		return;
@@ -1101,6 +1111,7 @@ void Drain() {
 }
 
 void Install(GraphicContext& graphics) {
+	g_independent_queue = static_cast<VkQueue>(graphics.readback_queue);
 	(void)graphics;
 	if (const char* env = std::getenv("KYTY_VK_THREAD"); env != nullptr && env[0] == '0') {
 		return;

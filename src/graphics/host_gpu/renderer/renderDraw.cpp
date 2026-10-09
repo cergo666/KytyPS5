@@ -1977,8 +1977,16 @@ bool RenderExecutor::TryDeferDispatchDirect(uint64_t submit_id, CommandBuffer& b
 // memory it read may have been written by the GPU (or downloaded) since it was submitted.
 static bool AsyncTaskStillValid(BufferCache& cache, const MaterializeTask& task) {
 	KYTY_PROFILER_BLOCK("Draw::ValidateAsync");
-	if (!task.ok || cache.GpuDirtyClearEpoch() != task.dirty_epoch) {
+	if (!task.ok) {
 		return false;
+	}
+	// Bytes published since the task was submitted invalidate it only where it read them.
+	if (cache.GpuDirtyClearEpoch() != task.dirty_epoch) {
+		for (const auto& read: task.reads) {
+			if (cache.ClearedSince(task.dirty_epoch, read.address, read.address + read.size)) {
+				return false;
+			}
+		}
 	}
 	uint64_t low = 0, high = 0;
 	if (!cache.GpuDirtyBounds(low, high)) {

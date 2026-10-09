@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -100,6 +101,24 @@ public:
 	[[nodiscard]] uint64_t GpuDirtyClearEpoch() const {
 		return m_gpu_dirty_clear_epoch.load(std::memory_order_acquire);
 	}
+	// Whether GPU-modified bytes overlapping [begin, end) were published after `epoch`. GPU
+	// thread only. Conservatively true once the epoch has left the bounded log.
+	[[nodiscard]] bool ClearedSince(uint64_t epoch, uint64_t begin, uint64_t end) const {
+		const auto current = m_gpu_dirty_clear_epoch.load(std::memory_order_acquire);
+		if (current == epoch) {
+			return false;
+		}
+		if (current - epoch > m_clear_log.size()) {
+			return true;
+		}
+		for (uint64_t e = epoch + 1; e <= current; e++) {
+			const auto& entry = m_clear_log[e % m_clear_log.size()];
+			if (entry.begin < end && begin < entry.end) {
+				return true;
+			}
+		}
+		return false;
+	}
 	[[nodiscard]] uint64_t BuffersGeneration() const {
 		return m_buffers_generation.load(std::memory_order_acquire);
 	}
@@ -186,6 +205,16 @@ private:
 	BufferMap                                         m_buffers;
 	std::atomic_uint64_t                              m_buffers_generation {0};
 	std::atomic_uint64_t                              m_gpu_dirty_clear_epoch {0};
+	struct DirtyClear {
+		uint64_t begin = 0, end = 0;
+	};
+	// Range published at each epoch, indexed by epoch modulo the size.
+	std::array<DirtyClear, 1024> m_clear_log {};
+	void                         LogDirtyClear(uint64_t begin, uint64_t end) {
+		const auto epoch = m_gpu_dirty_clear_epoch.load(std::memory_order_relaxed) + 1;
+		m_clear_log[epoch % m_clear_log.size()] = {begin, end};
+		m_gpu_dirty_clear_epoch.store(epoch, std::memory_order_release);
+	}
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	RangeSet                                          m_unsubmitted_writes;

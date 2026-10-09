@@ -3,16 +3,17 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <optional>
 #include <condition_variable>
 #include <memory>
+#include <deque>
 #include <mutex>
-
-#include <queue>
-
+#include <optional>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -40,9 +41,18 @@ public:
 	// that tick of the master timeline (0: nothing to wait for).
 	template <typename Record>
 	void SubmitDetached(Record&& record, std::optional<uint64_t> writer_tick = std::nullopt) {
+		// On the readback queue the copy is independent of the deferred Vulkan stream: record and
+		// submit it directly, without waiting for the recorder to drain.
+		const bool direct   = writer_tick.has_value() && HasReadbackQueue();
+		const bool deferral = direct ? SuspendRecorderDeferral() : false;
 		record(BeginDetached());
 		EndDetached(writer_tick);
+		if (direct) {
+			ResumeRecorderDeferral(deferral);
+		}
 	}
+	static bool SuspendRecorderDeferral();
+	static void ResumeRecorderDeferral(bool previous);
 	[[nodiscard]] bool HasReadbackQueue() const noexcept;
 	// Work that runs after everything already submitted but ahead of the recording command
 	// buffer. BeginAhead returns a recording buffer; SubmitAheadAndWait runs it and blocks.
@@ -55,12 +65,18 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Waits only for operations up to `tick` that may write one of `ranges` (operations without a
+	// declared range count as writing everything); later or unrelated publications may follow.
+	void                      WaitPriorityOperations(uint64_t tick, std::span<const GuestRange> ranges);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// An empty range is host-only; an omitted range conservatively aliases all guest memory.
+	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+	                                                 std::optional<GuestRange>      range = std::nullopt);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	// True while an operation deferred at `tick` or later has not completed.
 	[[nodiscard]] bool        HasPriorityOperationsSince(uint64_t tick);
+	[[nodiscard]] bool        HasPendingPriorityOperations(GuestRange range);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -101,13 +117,15 @@ private:
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
+		std::optional<GuestRange>    range;
 	};
 
 	void              BeginNext();
 	vk::CommandBuffer BeginDetached();
 	void              EndDetached(std::optional<uint64_t> writer_tick);
 	void              PriorityOperationsThread(std::stop_token stop);
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+	                    std::optional<GuestRange> range = std::nullopt);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
@@ -120,14 +138,15 @@ private:
 	Common::Mutex&                   m_queue_mutex;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
-	std::queue<PendingOperation> m_pending_operations;
+	std::deque<PendingOperation> m_pending_operations;
 	uint32_t                     m_refresh_skip = 0;
-	std::queue<PendingOperation> m_priority_operations;
+	std::deque<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
+	std::optional<GuestRange>    m_priority_active_range;
 	OperationState               m_operation_state      = OperationState::Open;
 	uint64_t                         m_last_priority_tick   = 0;
 	vk::CommandPool                  m_ahead_pool           = nullptr;
