@@ -89,6 +89,17 @@ public:
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
 
+	enum class DlssMode { Off, Quality, Balanced, Performance, UltraPerformance, DLAA };
+	Q_ENUM(DlssMode)
+	enum class UpscaleBackend { Native, OptiScaler };
+	Q_ENUM(UpscaleBackend)
+	enum class UpscaleMotion { Hybrid, Geometry };
+	Q_ENUM(UpscaleMotion)
+	enum class OptiScalerUpscaler { Auto, Fsr, XeSS };
+	Q_ENUM(OptiScalerUpscaler)
+	enum class OptiScalerFrameGeneration { Fsr, XeSS };
+	Q_ENUM(OptiScalerFrameGeneration)
+
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
@@ -115,6 +126,15 @@ public:
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	DlssMode                  dlss_mode                   = DlssMode::Off;
+	UpscaleBackend            upscale_backend             = UpscaleBackend::Native;
+	UpscaleMotion             upscale_motion              = UpscaleMotion::Hybrid;
+	QString                   optiscaler_path;
+	OptiScalerUpscaler        optiscaler_upscaler         = OptiScalerUpscaler::Auto;
+	OptiScalerFrameGeneration optiscaler_frame_generation = OptiScalerFrameGeneration::Fsr;
+	int                       render_scale_percent        = 100;
+	bool                      dlss_frame_generation       = false;
+	int                       frame_generation_frames     = 1;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
@@ -150,6 +170,15 @@ public:
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
+		dlss_mode                   = other.dlss_mode;
+		upscale_backend             = other.upscale_backend;
+		upscale_motion              = other.upscale_motion;
+		optiscaler_path             = other.optiscaler_path;
+		optiscaler_upscaler         = other.optiscaler_upscaler;
+		optiscaler_frame_generation = other.optiscaler_frame_generation;
+		render_scale_percent        = other.render_scale_percent;
+		dlss_frame_generation       = other.dlss_frame_generation;
+		frame_generation_frames     = other.frame_generation_frames;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;

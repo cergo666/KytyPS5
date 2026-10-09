@@ -751,8 +751,16 @@ static bool IsDeferSafePacket(cp_op_parser_func_t handler, uint32_t packet_heade
 	    handler == CpOpIndexType || handler == CpOpIndexBase || handler == CpOpIndexBufferSize ||
 	    handler == CpOpNumInstances || handler == CpOpSetBase || handler == CpOpDrawIndex ||
 	    handler == CpOpDrawIndexOffset || handler == CpOpDispatchDirect ||
-	    handler == CpOpDrawIndexAuto || handler == CpOpAcquireMem) {
+	    handler == CpOpDrawIndexAuto) {
 		return true;
+	}
+	// KYTY_ACQUIRE_FLUSH=1: ACQUIRE_MEM flushes the deferred draws again, as before.
+	static const bool acquire_flush = [] {
+		const char* env = std::getenv("KYTY_ACQUIRE_FLUSH");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (handler == CpOpAcquireMem) {
+		return !acquire_flush;
 	}
 	if (handler == CpOpEventWrite) {
 		// Barrier events queue behind the deferred work (EmitGlobalBarrier). The occlusion-counter
@@ -766,7 +774,7 @@ static bool IsDeferSafePacket(cp_op_parser_func_t handler, uint32_t packet_heade
 	if (handler == CpOpNop) {
 		const auto r = KYTY_PM4_R(packet_header & ~1u);
 		if (r == Pm4::R_ACQUIRE_MEM) {
-			return true;
+			return !acquire_flush;
 		}
 		if (r == Pm4::R_ZERO) {
 			// Plain padding; the 0x6875xxxx form is a marker with side effects.

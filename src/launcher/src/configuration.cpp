@@ -1,5 +1,7 @@
 #include "configuration.h"
 
+#include <algorithm>
+
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
@@ -8,6 +10,15 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(user_id);
 	KYTY_CFG_SET(audio_input_device);
 	KYTY_CFG_SET(present_mode);
+	KYTY_CFG_SET(dlss_mode);
+	KYTY_CFG_SET(upscale_backend);
+	KYTY_CFG_SET(upscale_motion);
+	KYTY_CFG_SET(optiscaler_path);
+	KYTY_CFG_SET(optiscaler_upscaler);
+	KYTY_CFG_SET(optiscaler_frame_generation);
+	KYTY_CFG_SET(render_scale_percent);
+	KYTY_CFG_SET(dlss_frame_generation);
+	KYTY_CFG_SET(frame_generation_frames);
 	KYTY_CFG_SET(gpu_index);
 	KYTY_CFG_SET(fullscreen_enabled);
 	KYTY_CFG_SET(hide_cursor_enabled);
@@ -50,6 +61,29 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	                         : Config::DEFAULT_USER_ID;
 	audio_input_device = s.value("audio_input_device", audio_input_device).toString();
 	KYTY_CFG_GET(present_mode);
+	// Older settings and invalid values must keep DLSS disabled.
+	const auto saved_dlss = TextToEnum<DlssMode>(s.value("dlss_mode", "Off").toString());
+	dlss_mode             = EnumToText(saved_dlss).isEmpty() ? DlssMode::Off : saved_dlss;
+	const auto backend =
+	    TextToEnum<UpscaleBackend>(s.value("upscale_backend", "Native").toString());
+	upscale_backend = EnumToText(backend).isEmpty() ? UpscaleBackend::Native : backend;
+	const auto motion =
+	    TextToEnum<UpscaleMotion>(s.value("upscale_motion", "Hybrid").toString());
+	upscale_motion  = EnumToText(motion).isEmpty() ? UpscaleMotion::Hybrid : motion;
+	optiscaler_path = s.value("optiscaler_path", "").toString();
+	const auto opti_upscaler =
+	    TextToEnum<OptiScalerUpscaler>(s.value("optiscaler_upscaler", "Auto").toString());
+	optiscaler_upscaler =
+	    EnumToText(opti_upscaler).isEmpty() ? OptiScalerUpscaler::Auto : opti_upscaler;
+	const auto opti_fg = TextToEnum<OptiScalerFrameGeneration>(
+	    s.value("optiscaler_frame_generation", "Fsr").toString());
+	optiscaler_frame_generation =
+	    EnumToText(opti_fg).isEmpty() ? OptiScalerFrameGeneration::Fsr : opti_fg;
+	bool       scale_ok     = false;
+	const auto scale        = s.value("render_scale_percent", 100).toInt(&scale_ok);
+	render_scale_percent    = scale_ok && scale >= 25 && scale <= 100 ? scale : 100;
+	dlss_frame_generation   = s.value("dlss_frame_generation", false).toBool();
+	frame_generation_frames = std::clamp(s.value("frame_generation_frames", 1).toInt(), 1, 4);
 	gpu_index = s.value("gpu_index", -1).toInt();
 	if (EnumToText(present_mode).isEmpty()) {
 		present_mode = PresentMode::Mailbox;

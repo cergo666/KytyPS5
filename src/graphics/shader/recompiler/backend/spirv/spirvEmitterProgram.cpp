@@ -85,6 +85,7 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
+	EmitGeometryMotion(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 

@@ -378,6 +378,14 @@ void AssignEvaluationIndices(ResourcePlan& plan) {
 }
 
 static Value InvariantPhi(const ResourcePlan& plan, const Inst& inst) {
+	// KYTY_NO_PHI_TABLE=1 resolves every phi again, as before.
+	static const bool no_table = [] {
+		const char* env = std::getenv("KYTY_NO_PHI_TABLE");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (no_table) {
+		return ResolveInvariantPhi(plan, Value(const_cast<Inst*>(&inst)));
+	}
 	if (const auto found = plan.invariant_phis.find(&inst); found != plan.invariant_phis.end()) {
 		return found->second;
 	}

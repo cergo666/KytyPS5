@@ -46,6 +46,9 @@ struct Real {
 	PFN_vkCmdCopyBuffer                       vkCmdCopyBuffer                       = nullptr;
 	PFN_vkCmdDraw                             vkCmdDraw                             = nullptr;
 	PFN_vkCmdClearColorImage                  vkCmdClearColorImage                  = nullptr;
+	PFN_vkCmdClearAttachments                 vkCmdClearAttachments                 = nullptr;
+	PFN_vkCmdBeginConditionalRenderingEXT     vkCmdBeginConditionalRenderingEXT     = nullptr;
+	PFN_vkCmdEndConditionalRenderingEXT       vkCmdEndConditionalRenderingEXT       = nullptr;
 	PFN_vkCmdCopyBufferToImage                vkCmdCopyBufferToImage                = nullptr;
 	PFN_vkCmdCopyImageToBuffer                vkCmdCopyImageToBuffer                = nullptr;
 	PFN_vkCmdDrawIndexed                      vkCmdDrawIndexed                      = nullptr;
@@ -627,6 +630,57 @@ void VKAPI_CALL WrapPushConstants(VkCommandBuffer command, VkPipelineLayout layo
 	});
 }
 
+void Fail(const char* what, VkResult result);
+
+struct ClearAttachmentsHead {
+	VkCommandBuffer command;
+	uint32_t        attachment_count;
+	uint32_t        rect_count;
+};
+void ReplayClearAttachments(std::byte* payload) {
+	Reader r {payload};
+	auto*  h           = r.Get<ClearAttachmentsHead>();
+	auto*  attachments = r.GetArray<VkClearAttachment>(h->attachment_count);
+	auto*  rects       = r.GetArray<VkClearRect>(h->rect_count);
+	g_real.vkCmdClearAttachments(h->command, h->attachment_count, attachments, h->rect_count,
+	                             rects);
+}
+void VKAPI_CALL WrapClearAttachments(VkCommandBuffer command, uint32_t attachment_count,
+                                     const VkClearAttachment* attachments, uint32_t rect_count,
+                                     const VkClearRect* rects) {
+	if (!t_defer) {
+		g_real.vkCmdClearAttachments(command, attachment_count, attachments, rect_count, rects);
+		return;
+	}
+	Emit(&ReplayClearAttachments, [&](auto& s) {
+		s.Put(ClearAttachmentsHead {command, attachment_count, rect_count});
+		s.PutArray(attachments, attachment_count);
+		s.PutArray(rects, rect_count);
+	});
+}
+
+struct ConditionalRenderingHead {
+	VkCommandBuffer                         command;
+	VkConditionalRenderingBeginInfoEXT info;
+};
+void ReplayBeginConditionalRendering(std::byte* payload) {
+	Reader r {payload};
+	auto*  h = r.Get<ConditionalRenderingHead>();
+	g_real.vkCmdBeginConditionalRenderingEXT(h->command, &h->info);
+}
+void VKAPI_CALL WrapBeginConditionalRendering(VkCommandBuffer                           command,
+                                              const VkConditionalRenderingBeginInfoEXT* info) {
+	if (!t_defer) {
+		g_real.vkCmdBeginConditionalRenderingEXT(command, info);
+		return;
+	}
+	if (info->pNext != nullptr) {
+		Fail("vkCmdBeginConditionalRenderingEXT with pNext", VK_ERROR_FEATURE_NOT_PRESENT);
+	}
+	Emit(&ReplayBeginConditionalRendering,
+	     [&](auto& s) { s.Put(ConditionalRenderingHead {command, *info}); });
+}
+
 struct ClearColorHead {
 	VkCommandBuffer   command;
 	VkImage           image;
@@ -1071,6 +1125,9 @@ void Install(GraphicContext& graphics) {
 	KYTY_HOOK(vkCmdCopyBuffer, WrapCopyBuffer);
 	KYTY_HOOK(vkCmdDraw, 0);
 	KYTY_HOOK(vkCmdClearColorImage, WrapClearColorImage);
+	KYTY_HOOK(vkCmdClearAttachments, WrapClearAttachments);
+	KYTY_HOOK(vkCmdBeginConditionalRenderingEXT, WrapBeginConditionalRendering);
+	KYTY_HOOK(vkCmdEndConditionalRenderingEXT, 0);
 	KYTY_HOOK(vkCmdCopyBufferToImage, WrapCopyBufferToImage);
 	KYTY_HOOK(vkCmdCopyImageToBuffer, WrapCopyImageToBuffer);
 	KYTY_HOOK(vkCmdDrawIndexed, 0);
@@ -1134,6 +1191,7 @@ void Install(GraphicContext& graphics) {
 	KYTY_SCALAR(vkCmdBindPipeline, VkPipelineBindPoint, VkPipeline);
 	KYTY_SCALAR(vkCmdDispatch, uint32_t, uint32_t, uint32_t);
 	KYTY_SCALAR(vkCmdEndRendering);
+	KYTY_SCALAR(vkCmdEndConditionalRenderingEXT);
 	KYTY_SCALAR(vkCmdDraw, uint32_t, uint32_t, uint32_t, uint32_t);
 	KYTY_SCALAR(vkCmdDrawIndexed, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
 	KYTY_SCALAR(vkCmdFillBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, uint32_t);
@@ -1166,6 +1224,8 @@ void Install(GraphicContext& graphics) {
 	redirect(d.vkCmdPushConstants, &WrapPushConstants);
 	redirect(d.vkCmdCopyBuffer, &WrapCopyBuffer);
 	redirect(d.vkCmdClearColorImage, &WrapClearColorImage);
+	redirect(d.vkCmdClearAttachments, &WrapClearAttachments);
+	redirect(d.vkCmdBeginConditionalRenderingEXT, &WrapBeginConditionalRendering);
 	redirect(d.vkCmdCopyBufferToImage, &WrapCopyBufferToImage);
 	redirect(d.vkCmdCopyImageToBuffer, &WrapCopyImageToBuffer);
 	redirect(d.vkCmdSetScissor, &WrapSetScissor);

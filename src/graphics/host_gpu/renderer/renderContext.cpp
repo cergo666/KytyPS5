@@ -18,7 +18,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_geometry_motion(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -117,6 +118,8 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	m_mapped_generation.fetch_add(1, std::memory_order_acq_rel);
+	// Buffers left from an earlier mapping may hold CPU writes made while unmapped.
+	m_buffer_cache.AddBdaPending(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -151,34 +154,21 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(bool has_address_writes) {
 	KYTY_PROFILER_BLOCK("Draw::PrepareBda");
+	if (has_address_writes) {
+		m_buffer_cache.NoteUnknownWrite();
+	}
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	// Synchronizing every mapped buffer only matters when guest writes, buffer creation or
-	// mapping changes happened since the previous pass. Generations are sampled before the scan
-	// so concurrent changes are picked up by the next call.
-	const auto cpu_dirty = RegionManager::CpuDirtyGeneration();
-	const auto buffers   = m_buffer_cache.BuffersGeneration();
-	const auto mapped    = m_mapped_generation.load(std::memory_order_acquire);
-	m_fault_process_pending = true;
-	if (m_bda_synced_valid && m_bda_synced_cpu_dirty == cpu_dirty && m_bda_synced_buffers == buffers &&
-	    m_bda_synced_mapped == mapped) {
-		return;
-	}
 	{
-		KYTY_PROFILER_BLOCK("Draw::PrepareBda(scan)");
+		KYTY_PROFILER_BLOCK("Draw::PrepareBda(sync)");
 		std::shared_lock lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-		});
+		m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 	}
-	m_bda_synced_cpu_dirty = cpu_dirty;
-	m_bda_synced_buffers   = buffers;
-	m_bda_synced_mapped    = mapped;
-	m_bda_synced_valid     = true;
+	m_fault_process_pending = true;
 }
 
 void RenderContext::RunGarbageCollector() {

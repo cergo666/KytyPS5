@@ -147,6 +147,9 @@ struct EmitterState {
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
+	uint32_t                                         motion_previous_variable              = 0;
+	uint32_t                                         motion_valid_variable                 = 0;
+	uint32_t                                         motion_output_variable                = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
@@ -156,6 +159,11 @@ struct EmitterState {
 uint32_t TypeVoid(EmitterState& state);
 uint32_t TypeBool(EmitterState& state);
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
+// On unless KYTY_NAN_SCRUB=0: float colour outputs and float storage-image writes replace NaN components
+// with 0, so one NaN cannot spread through temporal history buffers.
+[[nodiscard]] bool NanScrubEnabled();
+// Returns `value` (a 4 x f32 vector) with NaN components replaced by 0.
+uint32_t ScrubNanF32Vector4(EmitterState& state, uint32_t value);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
@@ -349,6 +357,9 @@ uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
                                  const char* name);
 void     DefineModule(EmitterState& state);
+bool     GeometryMotionEnabled(const EmitterState& state);
+void     DefineGeometryMotion(EmitterState& state);
+void     EmitGeometryMotion(EmitterState& state);
 void     DefineTessellationInterfaces(EmitterState& state);
 void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,

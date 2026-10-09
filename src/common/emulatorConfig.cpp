@@ -64,6 +64,38 @@ PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
 
+DlssMode GetDlssMode() {
+	return g_config->dlss_mode;
+}
+
+UpscaleBackend GetUpscaleBackend() {
+	return g_config->upscale_backend;
+}
+UpscaleMotion GetUpscaleMotion() {
+	return g_config->upscale_motion;
+}
+const std::string& GetOptiScalerPath() {
+	return g_config->optiscaler_path;
+}
+OptiScalerUpscaler GetOptiScalerUpscaler() {
+	return g_config->optiscaler_upscaler;
+}
+OptiScalerFrameGeneration GetOptiScalerFrameGeneration() {
+	return g_config->optiscaler_frame_generation;
+}
+
+uint32_t GetRenderScalePercent() {
+	return std::clamp(g_config->render_scale_percent, 25u, 100u);
+}
+
+uint32_t GetFrameGenerationFrames() {
+	return std::clamp(g_config->frame_generation_frames, 1u, 4u);
+}
+
+bool DlssFrameGenerationEnabled() {
+	return g_config->dlss_frame_generation;
+}
+
 int32_t GetGpuIndex() {
 	return g_config->gpu_index;
 }

@@ -48,6 +48,16 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 include("${KYTY_SOURCE_DIR}/utils.cmake")
 include(CTest)
 
+if(BUILD_TESTING)
+	add_executable(frame_pacer_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FramePacerTests.cpp")
+	target_include_directories(frame_pacer_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_test(NAME presentation_frame_pacer COMMAND frame_pacer_tests)
+	add_executable(prepared_frame_selection_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PreparedFrameSelectionTests.cpp")
+	target_include_directories(prepared_frame_selection_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_test(NAME prepared_frame_selection COMMAND prepared_frame_selection_tests)
+	set_tests_properties(prepared_frame_selection PROPERTIES LABELS "presentation;headless")
+endif()
+
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
 
 set(KYTY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
@@ -193,6 +203,8 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
 config_compiler_and_linker()
 
+include("${KYTY_SOURCE_DIR}/dlss.cmake")
+
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
@@ -302,9 +314,13 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
+	"${gpu_tiler_shader_dir}/emulator_dlss_reduce.comp"
+	"${gpu_tiler_shader_dir}/emulator_dlss_flow.comp"
+	"${gpu_tiler_shader_dir}/emulator_dlss_inputs.comp"
+	"${gpu_tiler_shader_dir}/emulator_dlss_copy.comp"
+	"${gpu_tiler_shader_dir}/color_clear_check.comp"
 )
-foreach(shader_source IN LISTS gpu_blit_shader_sources)
-	get_filename_component(shader_name "${shader_source}" NAME_WE)
+function(add_gpu_blit_shader shader_source shader_name)
 	set(shader_spv "${gpu_blit_generated_dir}/${shader_name}.spv")
 	set(shader_header "${gpu_blit_generated_dir}/${shader_name}_spv.h")
 	string(TOUPPER "${shader_name}_SPV" shader_symbol)
@@ -312,14 +328,19 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
 		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
+		        ${ARGN} "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
 		DEPENDS "${shader_source}"
 		VERBATIM
 	)
-	list(APPEND gpu_blit_shader_headers "${shader_header}")
+	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
+endfunction()
+foreach(shader_source IN LISTS gpu_blit_shader_sources)
+	get_filename_component(shader_name "${shader_source}" NAME_WE)
+	add_gpu_blit_shader("${shader_source}" "${shader_name}")
 endforeach()
+add_gpu_blit_shader("${gpu_tiler_shader_dir}/emulator_dlss_inputs.comp" "emulator_dlss_fg_inputs" -DKYTY_FG_INPUTS=1)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -332,7 +353,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus kyty_dlss_sdk)
 
 # Linux system libraries.
 if(LINUX)
@@ -389,7 +410,69 @@ function(configure_macos_guest_address_space target)
 	endif()
 endfunction()
 
+function(configure_windows_image_layout target)
+	if(KYTY_CLANG_CL)
+		if(KYTY_ENABLE_DLSS OR KYTY_ENABLE_DLSS_FG)
+			# NGX's Vulkan extensions fail device creation with ASLR disabled.
+			# Keep the GPU regression executable on the same layout as the engine.
+			target_link_options(${target} PRIVATE "/DYNAMICBASE" "/HIGHENTROPYVA")
+		else()
+			target_link_options(${target} PRIVATE "/DYNAMICBASE:NO")
+		endif()
+	endif()
+endfunction()
+
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+if(KYTY_ENABLE_DLSS)
+	add_kyty_full_emulator_test(dlss_gpu_tests "${KYTY_TESTS_DIR}/DlssGpuTests.cpp")
+	configure_windows_image_layout(dlss_gpu_tests)
+	deploy_kyty_dlss(dlss_gpu_tests)
+	add_test(NAME dlss_gpu COMMAND dlss_gpu_tests)
+	add_test(NAME dlss_optiscaler_unavailable COMMAND dlss_gpu_tests --optiscaler-unavailable)
+	add_test(NAME dlss_optiscaler COMMAND dlss_gpu_tests --optiscaler-gpu)
+	add_test(NAME dlss_optiscaler_presentation COMMAND dlss_gpu_tests --optiscaler-presentation)
+	foreach(backend Fsr XeSS)
+		add_test(NAME dlss_${backend}_presentation COMMAND dlss_gpu_tests --optiscaler-presentation)
+		set_tests_properties(dlss_${backend}_presentation PROPERTIES
+			SKIP_RETURN_CODE 77 LABELS "gpu;upscale" TIMEOUT 120
+			ENVIRONMENT "KYTY_OPTISCALER_TEST_UPSCALER=${backend}")
+	endforeach()
+	set_tests_properties(dlss_optiscaler_presentation PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;upscale" TIMEOUT 120)
+	set_tests_properties(dlss_optiscaler PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;upscale;headless" TIMEOUT 120)
+	add_test(NAME optiscaler_frame_generation COMMAND dlss_gpu_tests --optiscaler-frame-generation)
+	add_test(NAME optiscaler_xess_frame_generation COMMAND dlss_gpu_tests --optiscaler-frame-generation)
+	set_tests_properties(optiscaler_xess_frame_generation PROPERTIES
+		SKIP_RETURN_CODE 77 LABELS "gpu;upscale" TIMEOUT 120
+		ENVIRONMENT "KYTY_OPTISCALER_TEST_FRAME_GENERATION=XeSS")
+	add_test(NAME optiscaler_frame_generation_pixels COMMAND dlss_gpu_tests --optiscaler-frame-generation-gpu)
+	set_tests_properties(optiscaler_frame_generation optiscaler_frame_generation_pixels PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "gpu;optiscaler")
+	add_test(NAME dlss_quality_cost COMMAND dlss_gpu_tests --quality-cost)
+	set_tests_properties(dlss_quality_cost PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;dlss;headless")
+	add_test(NAME dlss_window_device COMMAND dlss_gpu_tests --window-device)
+	add_test(NAME dlss_window_device_off COMMAND dlss_gpu_tests --window-device-off)
+	if(KYTY_ENABLE_DLSS_FG)
+		add_test(NAME dlss_frame_generation COMMAND dlss_gpu_tests --frame-generation)
+		add_test(NAME dlss_frame_generation_off COMMAND dlss_gpu_tests --frame-generation-off)
+		set_tests_properties(dlss_frame_generation dlss_frame_generation_off PROPERTIES TIMEOUT 60 LABELS "gpu;dlss")
+		add_test(NAME dlss_frame_generation_validation_fallback COMMAND dlss_gpu_tests --frame-generation-validation-fallback)
+		add_test(NAME dlss_frame_generation_extension_fallback COMMAND dlss_gpu_tests --frame-generation-extension-fallback)
+		set_tests_properties(dlss_frame_generation_validation_fallback dlss_frame_generation_extension_fallback PROPERTIES TIMEOUT 60 LABELS "gpu;dlss")
+	endif()
+	add_test(NAME dlss_emulator_presentation COMMAND dlss_gpu_tests --emulator-presentation)
+	foreach(regression srgb fallback pool detail spatial)
+		add_test(NAME dlss_presentation_${regression} COMMAND dlss_gpu_tests --presentation-regression ${regression})
+		set_tests_properties(dlss_presentation_${regression} PROPERTIES LABELS "gpu;dlss")
+	endforeach()
+	add_test(NAME presentation_window_title COMMAND dlss_gpu_tests --window-title-timing)
+	set_tests_properties(presentation_window_title PROPERTIES TIMEOUT 15)
+	set_tests_properties(dlss_gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;dlss;headless")
+	set_tests_properties(dlss_window_device dlss_window_device_off dlss_emulator_presentation PROPERTIES LABELS "gpu;dlss")
+endif()
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+	add_test(NAME frame_timing_analysis COMMAND ${Python3_EXECUTABLE} -B "${KYTY_TESTS_DIR}/FrameTimingAnalysisTests.py")
+endif()
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -587,11 +670,14 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
+configure_windows_image_layout(virtual_memory_allocation_tests)
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 # These tests use exceptions.
-if(NOT KYTY_CLANG_CL)
+if(KYTY_CLANG_CL)
+	target_compile_options(virtual_memory_allocation_tests PRIVATE /EHsc)
+else()
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
@@ -645,6 +731,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME guest_fixed_address_layout
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --fixed-address-layout-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
@@ -685,6 +773,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		frame_pacer_tests
+		prepared_frame_selection_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -715,6 +805,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	if(KYTY_ENABLE_DLSS)
+		add_dependencies(kyty_tests dlss_gpu_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
@@ -735,7 +828,13 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+configure_windows_image_layout(kyty_emulator)
 configure_macos_guest_address_space(kyty_emulator)
+deploy_kyty_dlss(kyty_emulator)
+if(KYTY_ENABLE_DLSS)
+	install(FILES "${KYTY_DLSS_RUNTIME}" DESTINATION .)
+	install(FILES "${KYTY_DLSS_SDK_ROOT}/LICENSE.txt" DESTINATION LICENSES RENAME NVIDIA-DLSS-LICENSE.txt)
+endif()
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
 add_custom_target(kyty_trophy_sound
@@ -774,7 +873,6 @@ set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
 	target_link_options(kyty_emulator PRIVATE
-		"/DYNAMICBASE:NO"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"

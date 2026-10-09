@@ -74,14 +74,31 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 // supported x86-64 hosts, and a locked read would be just as stale once the lock was released.
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	// KYTY_DIRTY_LOCK=1 takes the region lock for these queries again (before upstream PR #955).
+	static const bool locked = [] {
+		const char* env = std::getenv("KYTY_DIRTY_LOCK");
+		return env != nullptr && env[0] == '1';
+	}();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		if (locked) {
+			std::scoped_lock lock(manager->lock);
+			return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		}
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
 	});
 }
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	static const bool locked = [] {
+		const char* env = std::getenv("KYTY_DIRTY_LOCK");
+		return env != nullptr && env[0] == '1';
+	}();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		if (locked) {
+			std::scoped_lock lock(manager->lock);
+			return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		}
 		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
 	});
 }
