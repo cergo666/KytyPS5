@@ -18,6 +18,14 @@
 
 #if defined(_MSC_VER) || defined(__clang__)
 #include <immintrin.h>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#endif
 #endif
 
 namespace Libs::Graphics::VkRecorder {
@@ -234,6 +242,12 @@ void Emit(ReplayFn fn, F&& serialize) {
 }
 
 void RecorderThread() {
+#if defined(_WIN32)
+	// Same rank as the GPU thread that feeds it.
+	if (const char* env = std::getenv("KYTY_PRIO_BANDS"); env == nullptr || env[0] != '0') {
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	}
+#endif
 	auto&    ring  = *g_ring;
 	uint64_t tail  = 0;
 	uint32_t spins = 0;

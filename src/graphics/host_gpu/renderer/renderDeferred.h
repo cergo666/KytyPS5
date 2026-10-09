@@ -16,7 +16,8 @@ namespace Libs::Graphics {
 // execute against. Its shader resources are materialized on a worker while the command
 // processor keeps decoding; FlushDeferredDraws() later executes the draw in stream order.
 struct DeferredDraw {
-	enum class Kind : uint8_t { Draw, DrawAuto, Dispatch };
+	// Barrier: a guest cache flush / partial flush (EVENT_WRITE) ordered between deferred work.
+	enum class Kind : uint8_t { Draw, DrawAuto, Dispatch, Barrier };
 	Kind                                 kind      = Kind::Draw;
 	uint64_t                             submit_id = 0;
 	DrawIndexArgs                        args;

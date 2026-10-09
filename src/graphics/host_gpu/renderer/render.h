@@ -194,6 +194,12 @@ public:
 	                                          uint32_t thread_group_z, uint32_t mode);
 	void               FlushDeferredDraws();
 	[[nodiscard]] bool HasDeferredDraws() const noexcept;
+	// Queues a global memory barrier behind the deferred work instead of flushing it. Returns false
+	// when nothing is deferred (the caller then records the barrier itself). Consecutive barriers
+	// collapse into one. Opt-in with KYTY_DEFER_BARRIER=1 (artifacts and lower FPS in UFC 5).
+	[[nodiscard]] bool TryDeferBarrier();
+	// Ends rendering and records a full memory barrier into the current command buffer.
+	void               RecordGlobalBarrier();
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
@@ -265,10 +271,8 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
-	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<uint32_t>                 m_image_occurrences;
 	std::unique_ptr<DeferredDrawQueue>    m_deferred;
 	uint32_t                              m_ops_since_submit = 0;
 

@@ -406,18 +406,27 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+	} else {
+		// The pipeline's dynamic depth bias must be set before every draw of this command buffer.
+		vk_buffer.setDepthBias(0.0f, 0.0f, 0.0f);
 	}
 
 	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	// Every dynamic state of the pipeline must be set in this command buffer before the draw,
+	// even while the stencil test is disabled (VUID-vkCmdDraw-None-07848 and its siblings).
+	const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
+		vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
+		vk_buffer.setStencilCompareMask(face, state.compareMask);
+		vk_buffer.setStencilWriteMask(face, state.writeMask);
+		vk_buffer.setStencilReference(face, state.reference);
+	};
 	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
-			vk_buffer.setStencilReference(face, state.reference);
-		};
 		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
 		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+	} else {
+		const vk::StencilOpState unused {vk::StencilOp::eKeep, vk::StencilOp::eKeep,
+		                                 vk::StencilOp::eKeep, vk::CompareOp::eAlways, 0, 0, 0};
+		set_stencil(vk::StencilFaceFlagBits::eFrontAndBack, unused);
 	}
 
 #if defined(__APPLE__)
@@ -547,27 +556,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
-		auto layout = image.backing.subresource_states.empty() ? image.backing.state.layout
-		                                                       : vk::ImageLayout::eUndefined;
-		if (!DepthAttachmentLayoutPermits(layout, draw_writes, sampled_aspects)) {
-			layout =
-			    depth_attachment_layout(ImageViewOps::DepthAspectMask(depth.desc.view_info.format),
-			                            draw_writes, sampled_aspects);
-		}
-		// A draw writing an aspect it also samples (possibly in another subresource) needs one
-		// layout for both.
-		if ((draw_writes & ~DepthWritableAspects(layout)) ||
-		    (sampled_aspects & ~DepthReadableAspects(layout))) {
+		auto layout = depth_attachment_layout(depth);
+		if (sampled_aspects & ~DepthReadableAspects(layout)) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
-		// The attachment store writes even when guest depth/stencil tests do not. Sampled targets
-		// take their shader reads here too, so binding them needs no second barrier.
-		const auto access =
-		    vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-		    vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-		    (sampled_aspects ? vk::AccessFlagBits2::eShaderRead : vk::AccessFlags2 {});
+		// The attachment store writes even when guest depth/stencil tests do not.
+		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;
@@ -1315,6 +1312,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                 draw.index_count, draw.instance_count, emit.first_instance);
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
+	m_context.GetBufferCache().RecordPendingWrites(
+	    std::any_of(stages.begin(), stages.end(), [](const PreparedBindings* stage) {
+		    return stage->runtime->program->has_address_writes;
+	    }));
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
@@ -1862,6 +1863,49 @@ static bool AsyncTaskStillValid(BufferCache& cache, const MaterializeTask& task)
 	return true;
 }
 
+bool RenderExecutor::TryDeferBarrier() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_DEFER_BARRIER"); // opt-in: caused artifacts and lower FPS in UFC 5
+		return env != nullptr && env[0] == '1';
+	}();
+	if (!enabled || m_deferred == nullptr || m_deferred->count == 0 || m_deferred->flushing) {
+		return false;
+	}
+	auto&      queue = *m_deferred;
+	const auto last  = (queue.head + queue.count - 1) % DeferredDrawQueue::kCapacity;
+	if (queue.slots[last]->kind == DeferredDraw::Kind::Barrier) {
+		return true; // nothing ran since the previous barrier
+	}
+	if (queue.count == DeferredDrawQueue::kCapacity) {
+		FlushDeferredDraws();
+		return false;
+	}
+	auto& slot = queue.slots[(queue.head + queue.count) % DeferredDrawQueue::kCapacity];
+	if (slot == nullptr) {
+		slot = std::make_unique<DeferredDraw>();
+	}
+	slot->kind = DeferredDraw::Kind::Barrier;
+	queue.count++;
+	return true;
+}
+
+void RenderExecutor::RecordGlobalBarrier() {
+	Common::LockGuard lock(m_context.GetMutex());
+
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	auto& scheduler               = m_context.GetCommandScheduler();
+	scheduler.EndRendering();
+	scheduler.Current().Handle().pipelineBarrier2(dependency);
+}
+
 void RenderExecutor::FlushDeferredDraws() {
 	if (m_deferred == nullptr || m_deferred->count == 0 || m_deferred->flushing) {
 		return;
@@ -1872,6 +1916,12 @@ void RenderExecutor::FlushDeferredDraws() {
 	auto& pipeline = m_context.GetPipelineCache();
 	while (queue.count != 0) {
 		DeferredDraw& draw = *queue.slots[queue.head];
+		if (draw.kind == DeferredDraw::Kind::Barrier) {
+			RecordGlobalBarrier();
+			queue.head = (queue.head + 1) % DeferredDrawQueue::kCapacity;
+			queue.count--;
+			continue;
+		}
 		const bool    is_dispatch = draw.kind == DeferredDraw::Kind::Dispatch;
 		std::array<PipelineCache::AsyncGraphics::Stage*, 2> stages {
 		    is_dispatch ? &draw.compute_async : &draw.async.vertex,

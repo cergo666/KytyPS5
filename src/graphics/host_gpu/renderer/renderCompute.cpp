@@ -24,7 +24,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
@@ -203,8 +202,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
-	if (ShaderRecompiler::IR::FindBinding(input.stage.program->bindings,
-	        ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory) == nullptr) {
+	if (input.stage.program->bindings.descriptor_counts[
+	        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] == 0) {
 		return;
 	}
 	auto& cache = context.GetBufferCache();
@@ -412,13 +411,16 @@ void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffe
 	}
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
-	if (Diag::MetaEnabled() && program.bindings.memory_offset_count != 0) {
+	if (Diag::MetaEnabled()) {
 		const uint32_t groups[3] {thread_group_x, thread_group_y, thread_group_z};
-		for (uint32_t i = 0; i < bindings.buffer_sources.size(); i++) {
-			const auto resource = program.bindings.descriptors.front().resources[i];
-			if (program.info.buffers[resource].written && bindings.buffer_sources[i].size != 0) {
-				Diag::RecordWrite(bindings.buffer_sources[i].address, bindings.buffer_sources[i].size,
-				                  program.shader_hash, groups, program.info.has_bitwise_xor);
+		for (const auto& resource: program.info.buffers) {
+			if (!resource.written || resource.descriptor_index >= bindings.buffer_sources.size()) {
+				continue;
+			}
+			const auto& source = bindings.buffer_sources[resource.descriptor_index];
+			if (source.size != 0) {
+				Diag::RecordWrite(source.address, source.size, program.shader_hash, groups,
+				                  program.info.has_bitwise_xor);
 			}
 		}
 	}
@@ -526,6 +528,7 @@ void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffe
 	Checkpoint::Mark(vk_buffer, 2, submit_id, program.shader_hash, 0, thread_group_x, thread_group_y,
 	                 thread_group_z);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	m_context.GetBufferCache().RecordPendingWrites(program.has_address_writes);
 	}
 
 	{
@@ -630,6 +633,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	m_context.GetBufferCache().RecordPendingWrites(program.has_address_writes);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
