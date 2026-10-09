@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -161,6 +162,14 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+static bool ReadbackDiagEnabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_DIAG_READBACK");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
+}
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
@@ -180,6 +189,24 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size, gather);
 	if (copies.empty()) {
 		return false;
+	}
+	const auto readback_begin = std::chrono::steady_clock::now();
+	// The newest submitted tick that wrote these bytes: recorded GPU writes (finished ones are
+	// pruned) and, as they have no known range, the latest shader address writes.
+	uint64_t writer_tick = 0;
+	bool     writer_done = false;
+	if (!async) {
+		for (const auto& copy: copies) {
+			writer_tick = std::max(writer_tick, LastWriteTick(buffer_address + copy.srcOffset,
+			                                                  buffer_address + copy.srcOffset +
+			                                                      copy.size));
+		}
+		writer_tick = std::max(writer_tick, m_address_write_tick);
+		if (ReadbackDiagEnabled()) {
+			auto& master = m_scheduler.GetMasterSemaphore();
+			master.Refresh();
+			writer_done = writer_tick != 0 && master.IsFree(writer_tick);
+		}
 	}
 	// Upstream PR #1254: read back data of already submitted work without splitting the command
 	// buffer. KYTY_NO_DETACHED_DOWNLOAD=1 restores the flush-and-wait path.
@@ -268,7 +295,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (detached) {
 		// The barrier orders the copy after every submitted command; no unsubmitted one writes
 		// these ranges. Recorded here, before the copy list moves into the publish step.
-		m_scheduler.SubmitDetached(record);
+		m_scheduler.SubmitDetached(record, m_scheduler.HasReadbackQueue()
+		                                       ? std::optional<uint64_t>(writer_tick)
+		                                       : std::nullopt);
 	} else {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -298,6 +327,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		for (const auto& [address, bytes]: neighbours) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(address, bytes);
 		}
+		if (ReadbackDiagEnabled()) {
+			const auto elapsed = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - readback_begin)
+			        .count());
+			ReportReadback(writer_tick, writer_done, total_size, detached, elapsed);
+		}
 	}
 	return true;
 }
@@ -314,8 +350,63 @@ bool BufferCache::CanDownloadDetached(uint64_t                        buffer_add
 	});
 }
 
+uint64_t BufferCache::LastWriteTick(uint64_t begin, uint64_t end) const {
+	uint64_t tick = 0;
+	for (const auto& write: m_write_ticks) {
+		if (write.begin < end && begin < write.end) {
+			tick = std::max(tick, write.tick);
+		}
+	}
+	return tick;
+}
+
+void BufferCache::ReportReadback(uint64_t writer_tick, bool writer_done, uint64_t bytes,
+                                 bool detached, uint64_t elapsed_ns) {
+	static uint64_t count = 0, done = 0, unknown = 0, total_bytes = 0, total_ns = 0, distance = 0,
+	                detached_count = 0, last_print = 0;
+	const auto current = m_scheduler.CurrentTick();
+	count++;
+	done += writer_done ? 1 : 0;
+	total_bytes += bytes;
+	total_ns += elapsed_ns;
+	detached_count += detached ? 1 : 0;
+	if (writer_tick == 0) {
+		unknown++;
+	} else {
+		distance += current - writer_tick;
+	}
+	const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+	if (last_print == 0) last_print = now;
+	if (static_cast<uint64_t>(now) - last_print >= 2'000'000'000ull) {
+		std::printf("[Readback] n=%llu detached=%llu writer_done=%llu writer_unknown=%llu "
+		            "avg_wait=%.2f ms avg_size=%llu B avg_tick_distance=%.1f\n",
+		            static_cast<unsigned long long>(count),
+		            static_cast<unsigned long long>(detached_count),
+		            static_cast<unsigned long long>(done), static_cast<unsigned long long>(unknown),
+		            count ? static_cast<double>(total_ns) / count / 1e6 : 0.0,
+		            static_cast<unsigned long long>(count ? total_bytes / count : 0),
+		            count > unknown ? static_cast<double>(distance) / (count - unknown) : 0.0);
+		std::fflush(stdout);
+		count = done = unknown = total_bytes = total_ns = distance = detached_count = 0;
+		last_print = now;
+	}
+}
+
 void BufferCache::MarkUnsubmittedWrite(uint64_t vaddr, uint64_t size) {
 	const auto tick = m_scheduler.CurrentTick();
+	{
+		if (!m_write_ticks.empty() && m_write_ticks.back().tick == tick &&
+		    m_write_ticks.back().end == vaddr) {
+			m_write_ticks.back().end = vaddr + size;
+		} else {
+			m_write_ticks.push_back({vaddr, vaddr + size, tick});
+		}
+		if (m_write_ticks.size() > 8192) {
+			auto& master = m_scheduler.GetMasterSemaphore();
+			master.Refresh();
+			std::erase_if(m_write_ticks, [&](const WriteTick& w) { return master.IsFree(w.tick); });
+		}
+	}
 	if (m_unsubmitted_tick != tick) {
 		m_unsubmitted_writes.Clear();
 		m_unsubmitted_tick = tick;
