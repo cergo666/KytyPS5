@@ -395,8 +395,8 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	DecodeVectorGpr(vdata, inst.dst);
 	DecodeVectorGpr(vaddr, inst.src0);
-	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
-	DecodeScalarSource(ssamp * 4u, pc, inst.src2);
+	DecodeScalarSource(srsrc * 4u, pc, inst, inst.src1);
+	DecodeScalarSource(ssamp * 4u, pc, inst, inst.src2);
 	inst.src_count = 3;
 }
 

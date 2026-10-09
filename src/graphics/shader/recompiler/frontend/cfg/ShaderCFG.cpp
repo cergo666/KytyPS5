@@ -326,7 +326,7 @@ bool ScalarCodeWrittenInRange(const Decoder::Program& program, uint32_t begin_in
 
 bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index,
                            SetpcTargetInfo& info) {
-	if (setpc_index < 4u || setpc_index >= program.instructions.size()) {
+	if (setpc_index < 3u || setpc_index >= program.instructions.size()) {
 		return false;
 	}
 
@@ -423,7 +423,7 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 
 bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_index,
                                 SetpcTargetInfo& info) {
-	if (setpc_index < 3u || setpc_index >= program.instructions.size()) {
+	if (setpc_index < 2u || setpc_index >= program.instructions.size()) {
 		return false;
 	}
 

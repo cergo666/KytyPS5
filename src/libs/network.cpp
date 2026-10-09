@@ -1070,9 +1070,10 @@ static int ConvertSocketOptionName(int level, int option) {
 			case 0x0020: return SO_BROADCAST;
 			case 0x1001: return SO_SNDBUF;
 			case 0x1002: return SO_RCVBUF;
+			case 0x1006: return SO_RCVTIMEO;
 			case 0x1007: return SO_ERROR;
 			case 0x1105: return SO_SNDTIMEO;
-			default: break;
+			default: return -1;
 		}
 	} else if (level == 6 && option == 1) {
 		return TCP_NODELAY;
@@ -2166,7 +2167,8 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	}
 
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
-	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	const bool send_timeout = (level == 0xffff && optname == 0x1105); // guest units: microseconds.
+	const bool recv_timeout = (level == 0xffff && optname == 0x1006); // guest units: milliseconds.
 	optname                = ConvertSocketOptionName(level, optname);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
@@ -2178,7 +2180,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 #endif
 	SocketLength len = static_cast<SocketLength>(*optlen);
 	void*        value = optval;
-	if (send_timeout) {
+	if (send_timeout || recv_timeout) {
 		if (*optlen < sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
@@ -2197,6 +2199,15 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 #endif
 		const int guest_timeout =
 		    static_cast<int>(std::min<int64_t>(usec, std::numeric_limits<int>::max()));
+		std::memcpy(optval, &guest_timeout, sizeof(guest_timeout));
+		len = sizeof(guest_timeout);
+	} else if (recv_timeout) {
+#if defined(_WIN32)
+		const int64_t ms = static_cast<int64_t>(timeout);
+#else
+		const int64_t ms = static_cast<int64_t>(timeout.tv_sec) * 1000 + timeout.tv_usec / 1000;
+#endif
+		const int guest_timeout = static_cast<int>(std::min<int64_t>(ms, std::numeric_limits<int>::max()));
 		std::memcpy(optval, &guest_timeout, sizeof(guest_timeout));
 		len = sizeof(guest_timeout);
 	}
@@ -2278,7 +2289,8 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 #endif
 		return failed ? SetHostSocketError() : 0;
 	}
-	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	const bool send_timeout = (level == 0xffff && optname == 0x1105); // guest units: microseconds.
+	const bool recv_timeout = (level == 0xffff && optname == 0x1006); // guest units: milliseconds.
 	optname                = ConvertSocketOptionName(level, optname);
 	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
@@ -2300,6 +2312,21 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 #else
 		timeout.tv_sec  = usec / 1'000'000;
 		timeout.tv_usec = usec % 1'000'000;
+#endif
+		optval = &timeout;
+		optlen = sizeof(timeout);
+	} else if (recv_timeout) {
+		if (optlen != sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		int ms = 0;
+		std::memcpy(&ms, optval, sizeof(ms));
+		ms = std::max(ms, 0);
+#if defined(_WIN32)
+		timeout = static_cast<DWORD>(ms);
+#else
+		timeout.tv_sec  = ms / 1000;
+		timeout.tv_usec = (ms % 1000) * 1000;
 #endif
 		optval = &timeout;
 		optlen = sizeof(timeout);

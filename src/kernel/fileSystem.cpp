@@ -75,6 +75,26 @@ struct File {
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
 	uint64_t                            dents_offset;
+	// Guarded by FileDescriptors::m_mutex. Delays the destructor started by
+	// DeleteDescriptor() until every GetFile() caller has released its
+	// reference, so a concurrent Close() can never free a File another
+	// thread is still reading from or writing to.
+	int                                  ref_count      = 0;
+	bool                                 pending_delete = false;
+};
+
+// RAII helper: releases a File obtained from FileDescriptors::GetFile() when
+// it goes out of scope, on every return path. Safe to construct with file ==
+// nullptr (GetFile() lookup miss).
+class FileGuard {
+public:
+	explicit FileGuard(File* file) : m_file(file) {}
+	~FileGuard();
+
+	KYTY_CLASS_NO_COPY(FileGuard);
+
+private:
+	File* m_file;
 };
 
 class FileDescriptors {
@@ -88,6 +108,7 @@ public:
 	void  DeleteDescriptor(int d);
 	File* GetFile(int d);
 	File* GetFile(const std::filesystem::path& real_name);
+	void  ReleaseFile(File* file);
 	void  CloseAll();
 
 private:
@@ -97,6 +118,8 @@ private:
 
 static MountPoints*     g_mount_points = nullptr;
 static FileDescriptors* g_files        = nullptr;
+
+FileGuard::~FileGuard() { g_files->ReleaseFile(m_file); }
 
 static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
@@ -205,14 +228,25 @@ void FileDescriptors::DeleteDescriptor(int d) {
 	EXIT_IF(index >= m_files.size());
 	EXIT_IF(m_files[index] == nullptr);
 	EXIT_IF(m_files[index]->opened);
+	EXIT_IF(m_files[index]->pending_delete);
+
+	auto* file            = m_files[index];
+	file->pending_delete = true;
+
+	if (file->ref_count > 0) {
+		// Still in use by a GetFile() caller on another thread; ReleaseFile()
+		// will finish the deletion once the last reference goes away.
+		return;
+	}
+
+	m_files[index] = nullptr;
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 	// Close host files opened before a failed descriptor setup.
-	m_files[index]->f.Close();
+	file->f.Close();
 #endif
 
-	delete m_files[index];
-	m_files[index] = nullptr;
+	delete file;
 }
 
 File* FileDescriptors::GetFile(int d) {
@@ -220,18 +254,47 @@ File* FileDescriptors::GetFile(int d) {
 
 	auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
 
-	if (index >= m_files.size()) {
+	if (index >= m_files.size() || m_files[index] == nullptr || m_files[index]->pending_delete) {
 		return nullptr;
 	}
 
+	m_files[index]->ref_count++;
 	return m_files[index];
+}
+
+void FileDescriptors::ReleaseFile(File* file) {
+	if (file == nullptr) {
+		return;
+	}
+
+	Common::LockGuard lock(m_mutex);
+
+	EXIT_IF(file->ref_count <= 0);
+
+	if (--file->ref_count != 0 || !file->pending_delete) {
+		return;
+	}
+
+	for (auto& f: m_files) {
+		if (f == file) {
+			f = nullptr;
+			break;
+		}
+	}
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	file->f.Close();
+#endif
+
+	delete file;
 }
 
 File* FileDescriptors::GetFile(const std::filesystem::path& real_name) {
 	Common::LockGuard lock(m_mutex);
 
 	for (auto* f: m_files) {
-		if (f != nullptr && f->real_name == real_name) {
+		if (f != nullptr && !f->pending_delete && f->real_name == real_name) {
+			f->ref_count++;
 			return f;
 		}
 	}
@@ -447,6 +510,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	int   descriptor = g_files->CreateDescriptor();
 	auto* file       = g_files->GetFile(descriptor);
+	FileGuard file_guard(file);
 
 	EXIT_IF(file == nullptr || file->opened || file->directory);
 
@@ -567,6 +631,7 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	}
 
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 
 	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;
@@ -595,6 +660,7 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 	}
 
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
 	}
@@ -625,6 +691,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	}
 
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 
 	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;
@@ -704,6 +771,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	}
 
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 
 	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
@@ -756,6 +824,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	}
 
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 
 	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;
@@ -846,6 +915,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		return KERNEL_ERROR_ESPIPE;
 	}
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 	if (file == nullptr || !file->opened || !file->readable) {
 		return KERNEL_ERROR_EBADF;
 	}
@@ -919,6 +989,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	}
 
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 
 	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
@@ -973,6 +1044,7 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 		return KERNEL_ERROR_ESPIPE;
 	}
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
 	}
@@ -1030,6 +1102,7 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	}
 
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 
 	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;
@@ -1145,6 +1218,7 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	}
 
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 
 	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;
@@ -1213,6 +1287,7 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	}
 
 	auto* file = g_files->GetFile(d);
+	FileGuard file_guard(file);
 
 	if (file == nullptr || !file->opened) {
 		return KERNEL_ERROR_EBADF;
@@ -1262,6 +1337,7 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 	}
 
 	auto* open_file = g_files->GetFile(real_file_name);
+	FileGuard open_file_guard(open_file);
 	bool  ok        = (open_file != nullptr && open_file->opened && !open_file->directory
 	                       ? open_file->f.Unlink()
 	                       : Common::File::DeleteFile(real_file_name));
@@ -1321,6 +1397,7 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 	}
 
 	auto* file = g_files->GetFile(fd);
+	FileGuard file_guard(file);
 
 	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;

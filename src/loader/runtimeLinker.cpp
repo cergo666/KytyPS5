@@ -825,6 +825,9 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 		case R_X86_64_GLOB_DAT:
 		case R_X86_64_JUMP_SLOT: addend = 0; [[fallthrough]];
 		case R_X86_64_64: {
+			EXIT_NOT_IMPLEMENTED(
+			    symbols == nullptr ||
+			    symbol >= program->dynamic_info->symbol_table_total_size / sizeof(Elf64_Sym));
 			auto         sym          = symbols[symbol];
 			auto         bind         = sym.GetBind();
 			auto         sym_type     = sym.GetType();
@@ -1724,8 +1727,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
 			uint64_t segment_addr        = phdr[i].p_vaddr + program->base_vaddr;
-			uint64_t segment_file_size   = phdr[i].p_filesz;
 			uint64_t segment_memory_size = GetAlignedSize(phdr + i);
+			EXIT_NOT_IMPLEMENTED(phdr[i].p_filesz > phdr[i].p_memsz);
+			uint64_t segment_file_size = phdr[i].p_filesz;
 			auto     mode                = GetMode(phdr[i].p_flags);
 
 			LOGF("[%d] addr        = 0x%016" PRIx64 "\n"
@@ -1904,6 +1908,19 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	GetDynDataOs(elf, &program->dynamic_info->symbol_table, DT_OS_SYMTAB);
 	GetDynData(elf, program->base_vaddr, &program->dynamic_info->symbol_table, DT_SYMTAB);
 	GetDynValue(elf, &program->dynamic_info->symbol_table_total_size, DT_OS_SYMTABSZ);
+
+	// DT_OS_SYMTAB/DT_OS_SYMTABSZ are guest-controlled; make sure the declared
+	// symbol table actually lies within this program's mapped memory before
+	// anything (GetRelocationInfo, CreateSymbolDatabase) indexes into it.
+	{
+		const auto symtab_addr = reinterpret_cast<uint64_t>(program->dynamic_info->symbol_table);
+		EXIT_NOT_IMPLEMENTED(symtab_addr < program->base_vaddr);
+		const auto symtab_offset = symtab_addr - program->base_vaddr;
+		EXIT_NOT_IMPLEMENTED(symtab_offset > program->mapped_size ||
+		                     program->dynamic_info->symbol_table_total_size >
+		                         program->mapped_size - symtab_offset);
+	}
+
 	GetDynValue(elf, &program->dynamic_info->symbol_table_entry_size, DT_OS_SYMENT);
 	GetDynValue(elf, &program->dynamic_info->symbol_table_entry_size, DT_SYMENT);
 
