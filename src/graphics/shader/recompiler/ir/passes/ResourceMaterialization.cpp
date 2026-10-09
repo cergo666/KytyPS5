@@ -10,7 +10,6 @@
 #include <array>
 #include <bit>
 #include <cstdio>
-#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -138,31 +137,6 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 		return false;
 	}
 	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
-	return true;
-}
-
-struct ReadCapture {
-	SrtRuntime                                  source;
-	std::vector<std::pair<uint64_t, uint64_t>>& ranges;
-};
-
-bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
-	auto& capture = *static_cast<ReadCapture*>(userdata);
-	if (!capture.source.read_specialization_memory(capture.source.userdata, address, values)) {
-		return false;
-	}
-	capture.ranges.emplace_back(address, values.size_bytes());
-	return true;
-}
-
-bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
-	auto& capture = *static_cast<ReadCapture*>(userdata);
-	if (capture.source.read_memory != nullptr) {
-		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
-	} else {
-		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
-	}
-	capture.ranges.emplace_back(address, values.size_bytes());
 	return true;
 }
 
@@ -953,6 +927,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.user_data_count            = program.user_data_count;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
+	plan.source_reads               = program.source_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 
@@ -1071,7 +1046,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
-	plan.capture_specialization_reads |= capture_indirect_reads || capture_control_reads;
+	plan.capture_specialization_reads |=
+	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
 	if (plan.capture_specialization_reads) {
 		// Every former flat alias now targets its retained raw read. Mark those reads
 		// on the normalized graph, so discarded Phi/EXEC dependencies stay discarded.
@@ -1106,27 +1082,23 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			if (image.written) MarkCleanReads(planned_reads, Source(plan, image.source));
 		}
 	}
-	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
+	if (capture_indirect_reads || !plan.source_reads.empty())
+		plan.resource_tracking_complete &= !program.has_address_writes;
 	return plan;
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
-	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
+	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
+	     runtime.read_specialization_memory == nullptr)) {
 		return false;
 	}
-	const bool capture_reads = program.capture_specialization_reads;
+	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
 	auto& reads = snapshot.specialization_reads;
-	reads.clear();
-	ReadCapture capture {runtime, reads};
-	SrtRuntime observed = runtime;
-	if (capture_reads) {
-		observed.userdata = &capture;
-		observed.read_specialization_memory = runtime.read_specialization_memory != nullptr
-		                                         ? CaptureStrictRead : nullptr;
-		observed.read_memory = CaptureOrdinaryRead;
-	}
+	reads = program.source_reads;
+	SrtReadCapture capture {runtime, reads};
+	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);

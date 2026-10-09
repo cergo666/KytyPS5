@@ -11,6 +11,35 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+SrtRuntime SrtReadCapture::ObservedRuntime() {
+	auto runtime = m_source;
+	runtime.userdata = this;
+	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
+	                                         ? ReadStrict : nullptr;
+	runtime.read_memory = ReadOrdinary;
+	return runtime;
+}
+
+bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address, values)) {
+		return false;
+	}
+	capture.m_ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
+bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	if (capture.m_source.read_memory != nullptr) {
+		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
+	} else {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	capture.m_ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
