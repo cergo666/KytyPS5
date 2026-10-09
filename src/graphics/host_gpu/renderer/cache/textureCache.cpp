@@ -9,6 +9,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/renderDiag.h"
+#include "gpu_blit_shaders/color_clear_check_spv.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -182,6 +183,9 @@ TextureCache::~TextureCache() {
 			UnregisterImage(id);
 		}
 	});
+	m_graphics.device.destroyPipeline(m_clear_check.pipeline, nullptr);
+	m_graphics.device.destroyPipelineLayout(m_clear_check.layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(m_clear_check.descriptors, nullptr);
 }
 
 bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -260,7 +264,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
-	m_total_used_memory += image.AccountedSize();
+	m_registered_memory += image.AccountedSize();
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -281,11 +285,12 @@ void TextureCache::UnregisterImage(ImageId id) {
 	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
-	if (accounted > m_total_used_memory) {
+	if (accounted > m_registered_memory) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
-	m_total_used_memory -= accounted;
+	m_registered_memory -= accounted;
 	image.registered = false;
+	++m_retirement_count;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -317,9 +322,14 @@ void TextureCache::DeleteImage(ImageId id) {
 			m_surface_metas.erase(metadata);
 		}
 	}
+	const auto bytes = image->AccountedSize();
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		m_pending_destroy_memory.fetch_add(bytes, std::memory_order_relaxed);
+		m_scheduler.DeferOperation([this, id, bytes] {
+			m_slot_images.erase(id);
+			m_pending_destroy_memory.fetch_sub(bytes, std::memory_order_relaxed);
+		});
 	} else {
 		m_slot_images.erase(id);
 	}
@@ -1226,9 +1236,15 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	const auto slice_size = range.size / layers;
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		if (!volume_texture &&
+		    MaterializeColorClearOnGpu(id, desc, clear_desc, range.address + slice_size * first,
+		                               slice_size, count, image_first)) {
+			return;
+		}
 		KYTY_PROFILER_BLOCK("Tex::MetaReadback");
 		if (Diag::MetaEnabled()) {
 			Diag::ReportMetaReadback(range.address, range.size);
@@ -1239,7 +1255,6 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			m_buffer_cache.ReadMemory(range.address, range.size, false);
 		}
 	}
-	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
@@ -1271,6 +1286,241 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
+}
+
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+                                              const ImageDesc& clear_desc, uint64_t address,
+                                              uint64_t slice_size, uint32_t count,
+                                              uint32_t image_first) {
+	const auto& view = clear_desc.view_info;
+	static const bool disabled = [] {
+		const char* env = std::getenv("KYTY_NO_GPU_CLEAR");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (disabled || !m_graphics.conditional_rendering_enabled || count > ClearCheckSlices ||
+	    view.level_count != 1 || slice_size / 4 > UINT32_MAX) {
+		return false;
+	}
+	{
+		// The clear may not happen, yet the image is then committed as GPU-written: limit
+		// that to images the GPU already owns or is about to render.
+		std::scoped_lock lock {m_lock};
+		if (desc.type != BindingType::RenderTarget && !m_slot_images[id].IsGpuModified()) {
+			return false;
+		}
+	}
+	const auto attachment = vk::FormatFeatureFlagBits::eColorAttachment;
+	if (!(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures & attachment) ||
+	    !(m_graphics.GetFormatProperties(m_slot_images[id].info.pixel_format)
+	          .optimalTilingFeatures &
+	      attachment)) {
+		return false;
+	}
+	// The same candidates the CPU path accepts, in DecodeColorClear's terms.
+	std::array<uint32_t, 2>                     codes {};
+	std::array<vk::ClearValue, ClearCheckCodes> clears {};
+	uint32_t                                    code_count = 0;
+	for (uint32_t code = 0; code < 256; code++) {
+		vk::ClearValue clear {};
+		if (!DecodeColorClear(clear_desc, static_cast<uint8_t>(code), clear.color)) {
+			continue;
+		}
+		if (code_count == ClearCheckCodes) {
+			return false;
+		}
+		codes[code_count / 4] |= code << (8 * (code_count % 4));
+		clears[code_count++] = clear;
+	}
+	if (code_count == 0) {
+		return true; // no byte decodes to a clear: the CPU path would skip every slice
+	}
+	// Expanded keys are written back like the CPU path, which skips video-out surfaces.
+	const bool write_back = desc.type != BindingType::VideoOut;
+	const auto size       = slice_size * count;
+	// After a write-back check, an unwritten range re-checks to no clears: matched slices
+	// now read 0xff and the rest still match nothing.
+	uint64_t   signature = 0xcbf29ce484222325ull;
+	const auto mix       = [&signature](uint32_t value) {
+        signature = (signature ^ value) * 0x100000001b3ull;
+	};
+	mix(codes[0]);
+	mix(codes[1]);
+	for (uint32_t k = 0; k < code_count; k++) {
+		for (const auto word: clears[k].color.uint32) {
+			mix(word);
+		}
+	}
+	if (write_back && m_buffer_cache.IsUnwritten(address, size)) {
+		const auto checked = m_clear_checked.find(address);
+		if (checked != m_clear_checked.end() && checked->second == signature) {
+			return true;
+		}
+	}
+	auto& check = m_clear_check;
+	if (!check.pipeline) {
+		const vk::DescriptorSetLayoutBinding bindings[] {
+		    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		};
+		vk::DescriptorSetLayoutCreateInfo layout_info {};
+		layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		layout_info.bindingCount = std::size(bindings);
+		layout_info.pBindings    = bindings;
+		RequireVulkanSuccess(
+		    m_graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &check.descriptors),
+		    "create clear-check descriptor layout");
+		const vk::PushConstantRange  push {vk::ShaderStageFlagBits::eCompute, 0, 24};
+		vk::PipelineLayoutCreateInfo pipeline_layout {};
+		pipeline_layout.setLayoutCount         = 1;
+		pipeline_layout.pSetLayouts            = &check.descriptors;
+		pipeline_layout.pushConstantRangeCount = 1;
+		pipeline_layout.pPushConstantRanges    = &push;
+		RequireVulkanSuccess(
+		    m_graphics.device.createPipelineLayout(&pipeline_layout, nullptr, &check.layout),
+		    "create clear-check pipeline layout");
+		const auto                    module = CompileSPV(COLOR_CLEAR_CHECK_SPV, m_graphics.device);
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName  = "main";
+		pipeline_info.layout       = check.layout;
+		const auto result = m_graphics.device.createComputePipelines(nullptr, 1, &pipeline_info,
+		                                                             nullptr, &check.pipeline);
+		m_graphics.device.destroyShaderModule(module, nullptr);
+		RequireVulkanSuccess(result, "create clear-check pipeline");
+		check.predicates =
+		    std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		                             vk::BufferUsageFlagBits::eStorageBuffer |
+		                                 vk::BufferUsageFlagBits::eConditionalRenderingEXT,
+		                             ClearCheckSlices * ClearCheckCodes * sizeof(uint32_t));
+	}
+
+	auto [metadata, metadata_offset] = m_buffer_cache.ObtainBuffer(address, size, write_back);
+	const auto alignment             = std::max<uint64_t>(
+        m_graphics.physical_device_properties.limits.minStorageBufferOffsetAlignment, 4);
+	const auto bind_offset = Common::AlignDown(metadata_offset, alignment);
+	const struct {
+		uint32_t                base_dword;
+		uint32_t                slice_dwords;
+		std::array<uint32_t, 2> codes;
+		uint32_t                code_count;
+		uint32_t                write_back;
+	} constants {static_cast<uint32_t>((metadata_offset - bind_offset) / 4),
+	             static_cast<uint32_t>(slice_size / 4), codes, code_count, write_back ? 1u : 0u};
+	static_assert(sizeof(constants) == 24);
+
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto           native          = command.Handle();
+	const vk::DeviceSize predicates_size = ClearCheckSlices * ClearCheckCodes * sizeof(uint32_t);
+	std::array<vk::BufferMemoryBarrier2, 2> before {};
+	before[0].srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	before[0].srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	before[0].dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	before[0].dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	before[0].buffer        = metadata->Handle();
+	before[0].offset        = bind_offset;
+	before[0].size          = metadata_offset - bind_offset + size;
+	before[1].srcStageMask  = vk::PipelineStageFlagBits2::eConditionalRenderingEXT;
+	before[1].dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	before[1].dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	before[1].buffer        = check.predicates->Handle();
+	before[1].size          = predicates_size;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(before.size());
+	dependency.pBufferMemoryBarriers    = before.data();
+	native.pipelineBarrier2(dependency);
+
+	const vk::DescriptorBufferInfo infos[] {
+	    {metadata->Handle(), bind_offset, before[0].size},
+	    {check.predicates->Handle(), 0, predicates_size},
+	};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t index = 0; index < writes.size(); ++index) {
+		writes[index].dstBinding      = index;
+		writes[index].descriptorCount = 1;
+		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[index].pBufferInfo     = &infos[index];
+	}
+	native.bindPipeline(vk::PipelineBindPoint::eCompute, check.pipeline);
+	native.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, check.layout, 0, writes);
+	native.pushConstants(check.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(constants),
+	                     &constants);
+	native.dispatch(count, 1, 1);
+
+	auto after             = before;
+	after[0].srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	after[0].srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	after[0].dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	after[0].dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	after[1].srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	after[1].srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	after[1].dstStageMask  = vk::PipelineStageFlagBits2::eConditionalRenderingEXT;
+	after[1].dstAccessMask = vk::AccessFlagBits2::eConditionalRenderingReadEXT;
+	dependency.pBufferMemoryBarriers = after.data();
+	native.pipelineBarrier2(dependency);
+
+	if (write_back) {
+		m_buffer_cache.MarkUnwritten(address, size);
+		m_clear_checked[address] = signature;
+	}
+	std::scoped_lock lock {m_lock};
+	ClearImageIf(command, id, view.format,
+	             {vk::ImageAspectFlagBits::eColor, view.base_level, 1, image_first, count},
+	             std::span {clears.data(), code_count}, check.predicates->Handle());
+	return true;
+}
+
+void TextureCache::ClearImageIf(CommandBuffer& command, ImageId id, vk::Format format,
+                                const vk::ImageSubresourceRange& range,
+                                std::span<const vk::ClearValue> clears, vk::Buffer predicates) {
+	auto& image = m_slot_images[id];
+	EXIT_IF(command.IsInvalid() || image.depth_id || image.info.IsVolume() ||
+	        range.baseMipLevel >= image.info.resources.levels ||
+	        range.baseArrayLayer + range.layerCount > image.backing.layers);
+	TrackImage(id);
+	// A clear may not happen, so the image keeps its other contents.
+	if (image.IsBufferModified() || image.IsCpuDirty()) {
+		InitializeImage(id);
+	}
+	command.EndRendering();
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+	const vk::Extent2D extent {std::max(image.info.extent.width >> range.baseMipLevel, 1u),
+	                           std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
+	const auto         native = command.Handle();
+	for (uint32_t layer = 0; layer < range.layerCount; layer++) {
+		ImageViewInfo view {};
+		view.format      = format;
+		view.type        = vk::ImageViewType::e2D;
+		view.base_level  = range.baseMipLevel;
+		view.base_layer  = range.baseArrayLayer + layer;
+		view.layer_count = 1;
+		view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		vk::RenderingAttachmentInfo attachment {};
+		attachment.imageView   = image.FindView(view);
+		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+		attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+		vk::RenderingInfo rendering {};
+		rendering.renderArea.extent    = extent;
+		rendering.layerCount           = 1;
+		rendering.colorAttachmentCount = 1;
+		rendering.pColorAttachments    = &attachment;
+		native.beginRendering(&rendering);
+		for (uint32_t k = 0; k < clears.size(); k++) {
+			vk::ConditionalRenderingBeginInfoEXT condition {};
+			condition.buffer = predicates;
+			condition.offset = (layer * ClearCheckCodes + k) * sizeof(uint32_t);
+			native.beginConditionalRenderingEXT(condition);
+			const vk::ClearAttachment clear {vk::ImageAspectFlagBits::eColor, 0, clears[k]};
+			const vk::ClearRect       rect {{{0, 0}, extent}, 0, 1};
+			native.clearAttachments(clear, rect);
+			native.endConditionalRenderingEXT();
+		}
+		native.endRendering();
+	}
+	CommitGpuWrite(image);
 }
 
 void TextureCache::RefreshImage(ImageId id) {
@@ -2060,39 +2310,58 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+static std::atomic<uint64_t> g_presented_frames {0};
+
+void TextureCache::NotifyFramePresented() {
+	g_presented_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	m_device_memory_usage =
+	    m_graphics.CanReportMemoryUsage()
+	        ? m_graphics.GetDeviceMemoryUsage()
+	        : m_registered_memory + m_pending_destroy_memory.load(std::memory_order_relaxed);
+	// One pass per presented frame; tests (no frames) and critical memory pressure keep the
+	// per-submission passes.
+	const auto frames = g_presented_frames.load(std::memory_order_relaxed);
+	if (frames != 0 && frames == m_gc_frame && m_device_memory_usage < m_critical_gc_memory) {
+		return;
 	}
+	m_gc_frame          = frames;
+	const uint64_t tick = m_gc_tick++;
 	static const bool gc_log = [] {
 		const char* env = std::getenv("KYTY_GC_LOG");
 		return env != nullptr && env[0] == '1';
 	}();
 	if (gc_log && tick % 300 == 0) {
-		std::printf("[GC] textures: used=%.2f GiB trigger=%.2f pressure=%.2f critical=%.2f GiB\n",
-		            static_cast<double>(m_total_used_memory) / (1ull << 30),
+		std::printf("[GC] textures: used=%.2f GiB trigger=%.2f pressure=%.2f critical=%.2f GiB "
+		            "retired=%llu\n",
+		            static_cast<double>(m_device_memory_usage) / (1ull << 30),
 		            static_cast<double>(m_trigger_gc_memory) / (1ull << 30),
 		            static_cast<double>(m_pressure_gc_memory) / (1ull << 30),
-		            static_cast<double>(m_critical_gc_memory) / (1ull << 30));
+		            static_cast<double>(m_critical_gc_memory) / (1ull << 30),
+		            static_cast<unsigned long long>(m_retirement_count));
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (m_device_memory_usage < m_trigger_gc_memory) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		bool pressured  = m_device_memory_usage >= m_pressure_gc_memory;
+		bool aggressive = allow_aggressive && m_device_memory_usage >= m_critical_gc_memory;
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
-			candidates.push_back(id);
-			return candidates.size() == deletions;
-		});
+		// The scan resumes where the previous pass stopped (upstream PR #1265), so images that
+		// cannot be collected do not block the ones after them. But a pass still considers no
+		// more than `deletions` candidates, counting the ones it skips, as before that PR: GC runs
+		// after every submission, and retiring that many images each time made the cache evict
+		// and recreate textures continuously (7 fps in UFC 5 fights).
+		m_lru_cache.ForEachItemBelowResuming(tick - age, deletions * 4u,
+		                                     [&](ImageId id) { candidates.push_back(id); });
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
@@ -2115,18 +2384,24 @@ void TextureCache::RunGarbageCollector() {
 				}
 			}
 			FreeImage(id);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			// Registration retirement is not physical reclamation. Pending GPU work
+			// still owns the allocation until its deferred destruction has run.
+			m_device_memory_usage = m_graphics.CanReportMemoryUsage()
+			                            ? m_graphics.GetDeviceMemoryUsage()
+			                            : m_registered_memory + m_pending_destroy_memory.load(
+			                                                        std::memory_order_relaxed);
+			if (m_device_memory_usage < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+			if (m_device_memory_usage < m_pressure_gc_memory && pressured) {
 				deletions >>= 1;
 				pressured = false;
 			}
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	if (m_device_memory_usage >= m_critical_gc_memory) {
 		collect(true);
 	}
 }

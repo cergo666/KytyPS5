@@ -16,6 +16,7 @@ namespace Libs::Graphics {
 
 class Presenter;
 class RenderContext;
+class DlssFrameGeneration;
 
 struct SurfaceCapabilities {
 	vk::SurfaceCapabilitiesKHR        capabilities {};
@@ -27,7 +28,6 @@ struct WindowLoopState {
 	SDL_Event        event {};
 	bool             need_exit = false;
 	std::atomic_bool paused    = false;
-	std::atomic<uint64_t> presented_frames {0};
 };
 
 struct WindowContext {
@@ -43,7 +43,8 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void UpdateTitle(uint64_t frame_num, double current_fps);
+	void UpdateTitle(bool dlss_active = false, bool new_guest_frame = true,
+	                 bool dlss_bypassed = false);
 	void                                                    Resize(int width, int height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
@@ -56,7 +57,11 @@ struct WindowContext {
 	SurfaceCapabilities            surface_capabilities;
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
+	std::unique_ptr<DlssFrameGeneration> frame_generation;
 	WindowLoopState                loop;
+	uint64_t title_fps_start = 0, title_frame_number = 0, title_fps_frames = 0;
+	uint64_t title_fg_display_start = 0;
+	bool     title_initialized      = false;
 
 	Common::Mutex mutex;
 };

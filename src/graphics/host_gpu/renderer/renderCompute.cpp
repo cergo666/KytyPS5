@@ -426,7 +426,7 @@ void RenderExecutor::DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffe
 	}
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Cmp::PrepareBda");
-		m_context.PrepareBda();
+		m_context.PrepareBda(program.has_address_writes);
 	}
 	RebindImages(bindings);
 	{
@@ -602,7 +602,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(program.has_address_writes);
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);

@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/geometryMotion.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
@@ -18,6 +19,7 @@
 #include <atomic>
 #include <memory>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -48,13 +50,32 @@ public:
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
+	GeometryMotion&     GetGeometryMotion() { return m_geometry_motion; }
+	// Raster pass scale per axis, chosen by presentation from the guest display
+	// and output sizes. 1 renders guest passes at their native size.
+	void SetRasterScale(float x, float y) {
+		m_raster_scale_x.store(x, std::memory_order_relaxed);
+		m_raster_scale_y.store(y, std::memory_order_relaxed);
+	}
+	// Whether presentation consumes temporal inputs (Super Resolution reconstructing,
+	// or Frame Generation active). Geometry motion capture is compiled in only then.
+	void SetTemporalInputsNeeded(bool needed) {
+		m_temporal_inputs_needed.store(needed, std::memory_order_relaxed);
+	}
+	[[nodiscard]] bool TemporalInputsNeeded() const {
+		return m_temporal_inputs_needed.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] std::pair<float, float> GetRasterScale() const {
+		return {m_raster_scale_x.load(std::memory_order_relaxed),
+		        m_raster_scale_y.load(std::memory_order_relaxed)};
+	}
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	void               PrepareBda();
+	void               PrepareBda(bool has_address_writes);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -77,6 +98,7 @@ private:
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
+	GeometryMotion            m_geometry_motion;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
@@ -89,6 +111,8 @@ private:
 	uint64_t                  m_bda_synced_buffers   = 0;
 	uint64_t                  m_bda_synced_mapped    = 0;
 	bool                      m_bda_synced_valid     = false;
+	std::atomic<float>        m_raster_scale_x {1.f}, m_raster_scale_y {1.f};
+	std::atomic<bool>         m_temporal_inputs_needed {false};
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

@@ -612,6 +612,11 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	                              integer ? TypeU32Vector(ctx.state, 4)
 	                                      : TypeF32Vector(ctx.state, 4),
 	                              texel, values[0], values[1], values[2], values[3]);
+	if (!integer && NanScrubEnabled() &&
+	    ctx.state.program.info.images[mem.resource].numeric_class ==
+	        Prospero::TextureNumericClass::Float) {
+		return PackImageTexel(ctx, mem, ScrubNanF32Vector4(ctx.state, texel));
+	}
 	return PackImageTexel(ctx, mem, texel);
 }
 

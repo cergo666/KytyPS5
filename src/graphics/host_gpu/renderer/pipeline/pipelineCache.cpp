@@ -80,8 +80,9 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	// Driver keys include SPIR-V/state; its version and UUID scope cached binaries.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
@@ -115,8 +116,24 @@ bool ReadShaderMemory(uint64_t address, std::span<uint32_t> values, ReadMapped&&
 	if (values.empty()) {
 		return false;
 	}
-	if (IsGpuMapped(address, values.size_bytes())) {
+	// KYTY_NO_UNMAPPED_ZERO=1 reads such memory as before upstream PR #1194.
+	static const bool keep_old = [] {
+		const char* env = std::getenv("KYTY_NO_UNMAPPED_ZERO");
+		return env != nullptr && env[0] == '1';
+	}();
+	if (keep_old || IsGpuMapped(address, values.size_bytes())) {
 		return read_mapped(address, values);
+	}
+	{
+		static std::atomic<uint64_t> unmapped_reads {0};
+		const auto n = unmapped_reads.fetch_add(1, std::memory_order_relaxed);
+		if (n < 8 || (n & (n - 1)) == 0) {
+			std::printf("[Shader] read of memory not mapped for the GPU (read as zero), #%llu: "
+			            "addr=0x%llx size=%llu\n",
+			            static_cast<unsigned long long>(n + 1),
+			            static_cast<unsigned long long>(address),
+			            static_cast<unsigned long long>(values.size_bytes()));
+		}
 	}
 	const auto word_mapped = [&](size_t index) {
 		return IsGpuMapped(address + index * sizeof(uint32_t), sizeof(uint32_t));
@@ -615,16 +632,8 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
+	// Bound stale entries accumulated across builds.
+	constexpr uint64_t MaxCacheBytes = 1ull << 30;
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
@@ -639,8 +648,7 @@ void PipelineCache::InitializeDriverCache() {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
+		if (file_size >= signature.size() + sizeof(uint64_t) && file_size <= MaxCacheBytes) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
 			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
@@ -663,7 +671,8 @@ void PipelineCache::InitializeDriverCache() {
 			}
 		} else {
 			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+			PipelineCacheLog("Vulkan pipeline cache: starting over {} (invalid or above 1 GiB)",
+			                 path);
 		}
 	}
 
@@ -754,7 +763,8 @@ PipelineCache::GraphicsPrepared PipelineCache::PrepareGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    bool allow_geometry_motion) {
 	KYTY_PROFILER_BLOCK("PC::PrepareGraphicsPrograms");
 	GraphicsPrepared prepared;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
@@ -847,21 +857,85 @@ PipelineCache::GraphicsPrepared PipelineCache::PrepareGraphicsPrograms(
 	prepared.vertex_params = vertex_params;
 	prepared.pixel_params  = pixel_params;
 	prepared.mesh_active   = mesh_active;
+	// The register-dependent half of the geometry-motion check (DLSS/FSR/XeSS inputs); the
+	// program-dependent half runs in ResolveGraphicsPrograms.
+	const auto& limits      = m_graphics.GetPhysicalDeviceProperties().limits;
+	prepared.motion_context =
+	    allow_geometry_motion && pixel_active && !mesh_active && !tess_active &&
+	    !context.GetClipControl().clip_disable &&
+	    (!context.GetBlendControl(0).enable || context.GetRenderTarget(0).info.blend_bypass) &&
+	    context.GetRenderTarget(0).attrib.num_fragments == 0 &&
+	    context.GetDepthZInfo().num_samples == 0 && limits.maxColorAttachments >= 8 &&
+	    limits.maxVertexOutputComponents >= 128 && limits.maxFragmentInputComponents >= 128;
 	return prepared;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::ResolveGraphicsPrograms(
     const GraphicsPrepared& prepared, std::array<ShaderVertexInputInfo, 3>& vertex_info,
     ShaderPixelInputInfo& pixel_info) {
+	const bool pixel_active = prepared.pixel_active;
+	const bool mesh_active  = prepared.mesh_active;
+	const auto& vertex_params = prepared.vertex_params;
+	const auto& pixel_params  = prepared.pixel_params;
 	uint32_t push_data_cursor =
-	    prepared.mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms result;
-	if (prepared.pixel_active) {
-		result.pixel = m_program_cache->Get(prepared.pixel_params, pixel_info, push_data_cursor);
+	if (pixel_active) {
+		// Keep fragment positions in guest pixel units while the attachment and
+		// viewport rasterize at a reduced resolution. Reserve these before any
+		// shader resource constants, including the mesh draw prefix.
+		pixel_info.raster_scale_dword = UINT32_MAX;
+		if (pixel_info.ps_pos_x || pixel_info.ps_pos_y) {
+			pixel_info.raster_scale_dword = push_data_cursor;
+			push_data_cursor += 2;
+		}
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
 	for (uint32_t i = 0; i < (prepared.tess_active ? 3u : 1u); i++) {
 		result.vertex[i] =
 		    m_program_cache->Get(prepared.vertex_params[i], vertex_info[i], push_data_cursor);
+	}
+	// Reserve spare interfaces only when ordinary guest vertex/fragment stages
+	// leave them unused. This is based on shader interfaces, never title hashes.
+	using namespace ShaderRecompiler;
+	const auto&           vs = *vertex_info[0].stage.program;
+	std::vector<uint32_t> active_pixel_inputs;
+	if (pixel_active) {
+		for (const auto& in: pixel_info.stage.program->info.inputs) {
+			if (in.kind == IR::StageInputKind::Parameter)
+				active_pixel_inputs.push_back(in.location);
+		}
+	}
+	// allow_geometry_motion carries whether presentation consumes temporal inputs.
+	const bool motion_candidate =
+	    prepared.motion_context && !pixel_info.dual_source_blending &&
+	    !pixel_info.ps_depth_export_enable && !pixel_info.ps_sample_mask_export_enable &&
+	    !vs.has_address_writes && (vs.param_export_mask & 0xfc000000u) == 0 &&
+	    std::ranges::any_of(
+	        vs.info.outputs,
+	        [](const auto& out) { return out.kind == IR::StageOutputKind::Position; }) &&
+	    std::ranges::all_of(vs.info.outputs,
+	                        [](const auto& out) {
+		                        return out.kind != IR::StageOutputKind::Layer &&
+		                               out.kind != IR::StageOutputKind::ViewportIndex;
+	                        }) &&
+	    std::ranges::all_of(pixel_info.stage.program->info.outputs,
+	                        [](const auto& out) {
+		                        return out.kind != IR::StageOutputKind::Mrt || out.index == 0;
+	                        }) &&
+	    std::ranges::all_of(pixel_info.stage.program->info.inputs, [&](const auto& in) {
+		    return in.kind != IR::StageInputKind::Parameter ||
+		           ShaderPixelParameterLocation(pixel_info, active_pixel_inputs, in.location) < 26;
+	    });
+	if (motion_candidate) {
+		push_data_cursor = 14; // Addresses, bounds, history, normalized viewport and raster extent.
+		vertex_info[0].geometry_motion_dword = pixel_info.geometry_motion_dword = 0;
+		if (pixel_info.raster_scale_dword != UINT32_MAX) {
+			pixel_info.raster_scale_dword = push_data_cursor;
+			push_data_cursor += 2;
+		}
+		result.pixel     = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.vertex[0] = m_program_cache->Get(vertex_params[0], vertex_info[0], push_data_cursor);
 	}
 	return result;
 }
@@ -870,11 +944,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    bool allow_geometry_motion) {
 	KYTY_PROFILER_BLOCK("PC::GetGraphicsPrograms");
-	const auto prepared =
-	    PrepareGraphicsPrograms(vertex_regs, pixel_regs, sh, context, user_config,
-	                            target_export_mapping, pixel_active, vertex_info, pixel_info);
+	const auto prepared = PrepareGraphicsPrograms(vertex_regs, pixel_regs, sh, context, user_config,
+	                                              target_export_mapping, pixel_active, vertex_info,
+	                                              pixel_info, allow_geometry_motion);
 	return ResolveGraphicsPrograms(prepared, vertex_info, pixel_info);
 }
 
@@ -1057,6 +1132,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			}
 		}
 	}
+	if (ps_active && ps_input_info->geometry_motion_dword != UINT32_MAX) {
+		rendering.color_count         = 8;
+		rendering.color_formats[7]    = vk::Format::eR16G16B16A16Sfloat;
+		static_params.color_mask[7]   = 0xf;
+		static_params.blend_enable[7] = false;
+	}
 	const bool with_depth =
 	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
 	if (with_depth) {
@@ -1178,7 +1259,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+	                       m_driver_cache);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

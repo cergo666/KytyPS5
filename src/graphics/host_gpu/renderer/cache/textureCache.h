@@ -12,7 +12,10 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <map>
+#include <memory>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -73,6 +76,10 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// Called once per presented guest frame. While frames are counted, collection runs at most
+	// once per frame (unless memory is critical), so image ages are measured in frames rather than
+	// in submissions (dozens per frame), as upstream PR #955 proposed.
+	static void NotifyFramePresented();
 
 private:
 	enum class TransferDirection { Upload, Download };
@@ -142,6 +149,18 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// GPU-written metadata: decides the clears on the GPU and gates them with conditional
+	// rendering instead of reading the metadata back. False when unsupported.
+	// `clear_desc` decodes the clear values in the format the target was rendered with (it can
+	// differ from the view, e.g. BGRA rendered and RGBA sampled); `desc` is the binding itself.
+	[[nodiscard]] bool MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+	                                              const ImageDesc& clear_desc, uint64_t address, uint64_t slice_size,
+	                                              uint32_t count, uint32_t image_first);
+	// Caller holds m_lock. Clears layer l of `range` to clears[k] when the predicate dword
+	// (l * ClearCheckCodes + k) is nonzero.
+	void                        ClearImageIf(CommandBuffer& command, ImageId id, vk::Format format,
+	                                         const vk::ImageSubresourceRange& range,
+	                                         std::span<const vk::ClearValue> clears, vk::Buffer predicates);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -178,11 +197,26 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	uint64_t                                          m_total_used_memory  = 0;
+	static constexpr uint32_t                         ClearCheckCodes  = 8;
+	static constexpr uint32_t                         ClearCheckSlices = 64;
+	struct ClearCheck {
+		vk::DescriptorSetLayout descriptors = nullptr;
+		vk::PipelineLayout      layout      = nullptr;
+		vk::Pipeline            pipeline    = nullptr;
+		std::unique_ptr<Buffer> predicates;
+	};
+	ClearCheck m_clear_check;
+	// Metadata address -> candidate signature of its last GPU check.
+	std::unordered_map<uint64_t, uint64_t>            m_clear_checked;
+	uint64_t                                          m_registered_memory = 0;
+	std::atomic<uint64_t>                             m_pending_destroy_memory {0};
+	uint64_t                                          m_device_memory_usage    = 0;
+	uint64_t                                          m_retirement_count       = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	uint64_t         m_gc_frame               = UINT64_MAX;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 

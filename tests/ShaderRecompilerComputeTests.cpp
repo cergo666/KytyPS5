@@ -169,6 +169,10 @@ struct BufferCacheTestAccess {
     return cache.m_download_buffer;
   }
 
+  static bool CanReadAhead(BufferCache &cache, uint64_t address, uint64_t size) {
+    return cache.CanReadAhead(address, size);
+  }
+
   static void SetUnusedStagingBufferSize(BufferCache &cache, uint64_t size) {
     // Called immediately after cache construction, before any staging reservation.
     std::destroy_at(&cache.m_staging_buffer);
@@ -232,6 +236,10 @@ struct TextureCacheTestAccess {
                          const vk::ClearValue &clear) {
     auto lock = Lock(cache);
     cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear);
+  }
+
+  static uint64_t PendingDestroyBytes(const TextureCache &cache) {
+    return cache.m_pending_destroy_memory.load(std::memory_order_relaxed);
   }
 
   static void ConfigureGarbageCollection(TextureCache &cache,
@@ -4061,7 +4069,7 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
-  void CheckBufferCacheDirtyGarbageCollection() {
+  void CheckBufferCacheDirtyGarbageCollection(bool sparse_upload_only = false) {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
     constexpr uint64_t allocation_size = 0x5000000;
@@ -4118,6 +4126,56 @@ public:
       auto &cache = resources.GetBufferCache();
       resources.MapMemory(base, allocation_size);
 
+      Require(name, "read-ahead before BDA writes",
+              BufferCacheTestAccess::CanReadAhead(cache, base, 4),
+              "idle recording tick unexpectedly blocked read-ahead");
+      resources.PrepareBda(false);
+      Require(name, "read-only BDA permits read-ahead",
+              BufferCacheTestAccess::CanReadAhead(cache, base, 4),
+              "BDA reads were treated as unknown writes");
+      resources.PrepareBda(true);
+      Require(name, "BDA stores serialize every possible target",
+              !BufferCacheTestAccess::CanReadAhead(cache, base, 4) &&
+                  !BufferCacheTestAccess::CanReadAhead(cache, base + 0x10000, 4),
+              "unknown BDA stores allowed same-tick readback");
+      scheduler.Finish();
+      Require(name, "BDA write guard expires after submission",
+              BufferCacheTestAccess::CanReadAhead(cache, base, 4),
+              "submitted BDA stores kept blocking subsequent read-ahead");
+
+      constexpr uint64_t unknown_target = base + 0x380;
+      constexpr uint32_t old_gpu_value = 0x31415926u;
+      constexpr uint32_t new_gpu_value = 0x27182818u;
+      (void)cache.ObtainBuffer(unknown_target, 4, true, true);
+      cache.FillBuffer(unknown_target, 4, old_gpu_value, false);
+      scheduler.Finish();
+      const auto [unknown_buffer, unknown_offset] =
+          cache.ObtainBuffer(unknown_target, 4, false);
+      resources.PrepareBda(true);
+      // Like an address store, this write has no descriptor range in NoteCurrentWrite.
+      scheduler.Current().Handle().fillBuffer(
+          unknown_buffer->Handle(), unknown_offset, 4, new_gpu_value);
+      Require(name, "readback after an unknown address write",
+              resources.HandleFault(PageFaultAccess::Read, unknown_target),
+              "GPU-dirty address did not trigger readback");
+      uint32_t published_unknown = 0;
+      Require(name, "unknown address write publishes fresh GPU data",
+              Libs::LibKernel::Memory::TryReadBacking(
+                  unknown_target, &published_unknown, sizeof(published_unknown)) &&
+                  published_unknown == new_gpu_value,
+              "read-ahead published the preceding tick's stale GPU value");
+
+      cache.MarkUnwritten(base + first_offset, 16);
+      std::thread invalidation([&] {
+        cache.InvalidateMemory(base + first_offset, 8);
+      });
+      invalidation.join();
+      Require(name, "CPU invalidation removes clear signature eligibility",
+              !cache.IsUnwritten(base + first_offset, 8) &&
+                  cache.IsUnwritten(base + first_offset + 8, 8),
+              "CPU invalidation retained a stale clear mark or removed disjoint marks");
+      cache.InvalidateMemory(base + first_offset + 8, 8);
+
       const auto MarkGpuWrite = [&](uint64_t address, uint64_t size) {
         auto allocation = cache.ObtainBuffer(address, size, true, false);
         Require(name, "dirty allocation", allocation.first != nullptr,
@@ -4148,6 +4206,51 @@ public:
         DestroyBuffer(&readback);
         return value;
       };
+
+      if (sparse_upload_only) {
+        // Broad descriptors can span a reserved hole between resident pages.
+        // Exercise the real upload path and verify the bytes read back from Vulkan.
+        constexpr uint64_t gap_page = 0x10000;
+        constexpr uint64_t gap_begin = base + 0x4e00000;
+        std::memset(reinterpret_cast<void *>(gap_begin), 0x3c, gap_page);
+        std::memset(reinterpret_cast<void *>(gap_begin + 2 * gap_page), 0xa7, gap_page);
+        resources.UnmapMemory(gap_begin + gap_page, gap_page);
+        Require(name, "sparse upload unmap",
+                Libs::LibKernel::Memory::KernelMunmap(gap_begin + gap_page, gap_page) == 0,
+                "failed to create a reserved gap in the buffer descriptor");
+        const auto [gap_buffer, gap_offset] =
+            cache.ObtainBuffer(gap_begin, 3 * gap_page, false);
+        Require(name, "sparse GPU upload",
+                ReadNativeValue(*gap_buffer, gap_offset) == 0x3c3c3c3cu &&
+                    ReadNativeValue(*gap_buffer, gap_offset + gap_page) == 0u &&
+                    ReadNativeValue(*gap_buffer, gap_offset + 2 * gap_page) == 0xa7a7a7a7u,
+                "buffer upload did not preserve resident bytes and zero the reserved gap");
+        // Exercise the small streaming path independently of the cached owner.
+        resources.UnmapMemory(gap_begin + gap_page, gap_page);
+        const auto [gap_stream, gap_stream_offset] =
+            cache.ObtainBuffer(gap_begin + gap_page, sizeof(uint32_t), false);
+        Require(name, "sparse stream upload",
+                gap_stream == &cache.GetUtilityBuffer(MemoryUsage::Stream) &&
+                    ReadNativeValue(*gap_stream, gap_stream_offset) == 0u,
+                "stream upload did not zero a reserved guest page");
+        void *gap_mapping = reinterpret_cast<void *>(gap_begin + gap_page);
+        Require(name, "sparse upload remap",
+                Libs::LibKernel::Memory::KernelMapDirectMemory(
+                    &gap_mapping, gap_page, 0x3, 0x10,
+                    direct_offset + gap_begin + gap_page - base, gap_page) == 0,
+                "failed to restore the sparse test mapping");
+        resources.MapMemory(gap_begin + gap_page, gap_page);
+        resources.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+        context.ShutdownGpu();
+        Require(name, "sparse upload cleanup",
+                Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                    Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                        direct_offset, allocation_size) == 0,
+                "failed to release the sparse upload fixture");
+        std::printf("[host]    BufferCacheSparseUpload          ok\n");
+        return;
+      }
 
       constexpr uint64_t stream_pages = base + 0x18000;
       constexpr uint64_t stream_address = stream_pages + 0x4000 - sizeof(uint32_t);
@@ -5310,6 +5413,20 @@ public:
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
     constexpr uint64_t read_write_meta = 0x0000000204202000ull;
     constexpr uint64_t write_only_meta = 0x0000000204202100ull;
+    // Wider texels hold the fill word in each 32-bit part; infinity/NaN fills stay buffer writes.
+    vk::ClearColorValue fill{};
+    Require(name, "fill clear",
+            DecodeColorDwordFill(vk::Format::eR16G16B16A16Sfloat, 0x3c003800u, fill) &&
+                fill.float32[0] == .5f && fill.float32[1] == 1.f && fill.float32[2] == .5f &&
+                fill.float32[3] == 1.f,
+            "RGBA16F fill was not decoded as a clear");
+    Require(name, "fill clear",
+            !DecodeColorDwordFill(vk::Format::eR16G16B16A16Sfloat, 0x7c000000u, fill),
+            "an RGBA16F infinity fill became a clear");
+    Require(name, "fill clear",
+            DecodeColorDwordFill(vk::Format::eR32G32Uint, 7u, fill) && fill.uint32[0] == 7u &&
+                fill.uint32[1] == 7u,
+            "RG32UI fill was not decoded as a clear");
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -8537,6 +8654,35 @@ public:
                                               &gc_stale_values[index],
                                               sizeof(uint32_t));
       }
+      // More protected old images than a bounded scan can visit in one call.
+      // A clean image after them must eventually be collected, while GPU-current
+      // downloadable images retain their content before memory pressure.
+      scheduler.Finish();
+      std::vector<ImageId> protected_old;
+      for (uint32_t index = 0; index < 45; ++index) {
+        auto desc = gc_image_desc_b;
+        desc.info.data.address = base + 0x380000 + index * 0x1000;
+        auto id = texture_cache.FindImage(desc);
+        texture_cache.MarkGpuWritten(id);
+        protected_old.push_back(id);
+      }
+      auto collectable_desc = gc_image_desc_b;
+      collectable_desc.info.data.address = base + 0x3b0000;
+      const auto collectable = texture_cache.FindImage(collectable_desc);
+      auto oldest = protected_old;
+      oldest.push_back(collectable);
+      TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache, oldest, 100, UINT64_MAX);
+      texture_cache.RunGarbageCollector();
+      Require(name, "bounded GC first batch", TextureCacheTestAccess::Contains(texture_cache, collectable),
+              "GC exceeded its bounded scan before the next collection pass");
+      texture_cache.RunGarbageCollector();
+      Require(name, "GC progresses past protected old images",
+              !TextureCacheTestAccess::Contains(texture_cache, collectable) &&
+              std::ranges::all_of(protected_old, [&](ImageId id) {
+                return TextureCacheTestAccess::Contains(texture_cache, id);
+              }), "ineligible old images blocked reclamation of a later clean image");
+      scheduler.Finish();
+      // Restore ordinary ages before continuing the readback fixture.
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_images, 17, UINT64_MAX);
       texture_cache.RunGarbageCollector();
@@ -8548,9 +8694,13 @@ public:
                                   }),
               "GC retired safely downloadable GPU images before pressure");
       const auto gc_batch_tick = scheduler.CurrentTick();
+      const auto pending_before_gc = TextureCacheTestAccess::PendingDestroyBytes(texture_cache);
       TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache,
                                                          gc_images, 81, 0);
       texture_cache.RunGarbageCollector();
+      Require(name, "GC physical memory pending GPU completion",
+              TextureCacheTestAccess::PendingDestroyBytes(texture_cache) > pending_before_gc,
+              "logical retirement was counted as physical reclamation before GPU completion");
       std::array<uint32_t, 2> gc_before_completion{};
       for (size_t index = 0; index < gc_image_offsets.size(); index++) {
         Libs::LibKernel::Memory::TryReadBacking(base + gc_image_offsets[index],
@@ -8569,6 +8719,9 @@ public:
               "completion");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
+      Require(name, "GC pending memory reclaimed after completion",
+              TextureCacheTestAccess::PendingDestroyBytes(texture_cache) == 0,
+              "completed GPU work retained pending image destruction bytes");
       auto refreshed_buffer_alias = resources.GetBufferCache().ObtainBuffer(
           gc_image_desc_a.info.data.address, gc_image_desc_a.info.data.size,
           false);
@@ -43106,6 +43259,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedTextureCacheFlow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-sparse-upload-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferCacheDirtyGarbageCollection(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {

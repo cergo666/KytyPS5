@@ -1,21 +1,20 @@
 #include "graphics/presentation/window.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
-#include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/dlssFrameGeneration.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -24,13 +23,14 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
 #include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -722,9 +722,6 @@ void WindowContext::Run() {
 	loop.need_exit = false;
 	loop.paused.store(false, std::memory_order_release);
 
-	constexpr uint64_t title_interval_ms = 1000;
-	auto               title_time        = SDL_GetTicks();
-	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
 
 	while (!loop.need_exit) {
 		if (loop.paused.load(std::memory_order_acquire)) {
@@ -735,20 +732,7 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		// Refresh the title on the main thread without making presentation wait for it.
-		const auto now     = SDL_GetTicks();
-		const auto elapsed = now - title_time;
-		if (elapsed >= title_interval_ms) {
-			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
-			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
-			}
-			title_time   = now;
-			title_frames = frames;
-		}
-		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
-		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
+		if (!HostInputWaitEvent(&loop.event, 1000)) {
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
@@ -930,7 +914,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
+void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame, bool dlss_bypassed) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -940,6 +924,8 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
+	double                   current_fps    = 0.0;
+	double                   display_fps    = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -949,14 +935,72 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	static constexpr auto build_type = "Unknown";
 #endif
 
+	const auto now       = Common::Timer::QueryPerformanceCounter();
+	const auto frequency = Common::Timer::QueryPerformanceFrequency();
+	const auto fg_display_frames = frame_generation ? frame_generation->TotalPresentedFrames() : 0;
+	if (!title_initialized) {
+		title_fps_start        = now;
+		title_fg_display_start = fg_display_frames;
+	}
+	if (new_guest_frame) {
+		++title_frame_number;
+		++title_fps_frames;
+	}
+	if (now - title_fps_start >= frequency) {
+		current_fps = static_cast<double>(title_fps_frames) * static_cast<double>(frequency) /
+		              static_cast<double>(now - title_fps_start);
+		display_fps = static_cast<double>(fg_display_frames - title_fg_display_start) *
+		              static_cast<double>(frequency) / static_cast<double>(now - title_fps_start);
+		title_fg_display_start = fg_display_frames;
+		title_fps_start        = now;
+		title_fps_frames       = 0;
+	} else if (title_initialized) {
+		return;
+	}
+	title_initialized = true;
+	// With FG, presented frames (rendered + generated) are what the player sees.
+	const bool fg_enabled = frame_generation && frame_generation->Enabled();
+
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	const auto  reconstruction =
+        Config::GetDlssMode() == Config::DlssMode::Off
+	         ? std::string {}
+	         : fmt::format(" [{}: {}]",
+                          Config::GetUpscaleBackend() == Config::UpscaleBackend::OptiScaler
+	                           ? "OptiScaler"
+	                           : "DLSS",
+                          dlss_active     ? "active"
+	                       : dlss_bypassed ? "native, source >= output"
+	                                       : "inactive");
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}{}{}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, title_frame_number, fg_enabled ? display_fps : current_fps,
+	    reconstruction,
+	    fg_enabled ? (frame_generation->Bridge()
+	                      ? " [OptiScaler FG: XeSS]"
+	                      : (frame_generation->External() ? " [OptiScaler FG: FSR]" : " [FG]"))
+	               : "");
 
-	SDL_SetWindowTitle(window, text.c_str());
+	struct TitleUpdate {
+		SDL_WindowID window_id;
+		std::string  text;
+	};
+	// Presentation must not wait for the UI event loop. Own the text until the
+	// callback runs, and resolve the window on the UI thread in case it closed.
+	auto* update = new TitleUpdate {SDL_GetWindowID(window), std::move(text)};
+	if (!SDL_RunOnMainThread(
+	        [](void* data) {
+		        std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
+		        if (auto* target = SDL_GetWindowFromID(title->window_id); target != nullptr) {
+			        SDL_SetWindowTitle(target, title->text.c_str());
+		        }
+	        },
+	        update, false)) {
+		delete update;
+		EXIT("Could not schedule window title update: %s\n", SDL_GetError());
+	}
 }
 
 } // namespace Libs::Graphics

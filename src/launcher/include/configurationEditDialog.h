@@ -47,10 +47,14 @@ private:
 protected:
 	void Init(const Configuration& info);
 	void InitGameDirectories();
+	void UpdateUpscaleSummary();
 	void AddGameDirectoryItem(const QString& dir);
 
 	void moveEvent(QMoveEvent* event) override;
 	void resizeEvent(QResizeEvent* event) override;
+	void showEvent(QShowEvent* event) override;
+	// Sizes the window to its contents but within the screen; the contents scroll.
+	void FitToScreen();
 
 	static QByteArray g_last_geometry;
 

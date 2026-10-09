@@ -74,7 +74,22 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
 		                          pointer, variable, ConstantU32(state, component));
 		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
-		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+		auto guest_value = value;
+		if (kind == IR::StageInputKind::FragCoord && component < 2 &&
+		    state.input_info.pixel->raster_scale_dword != UINT32_MAX) {
+			const auto scale_pointer = state.builder.AllocateId();
+			const auto scale_bits    = state.builder.AllocateId();
+			const auto scale         = state.builder.AllocateId();
+			guest_value              = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    spv::OpAccessChain, TypePushConstantElementPointer(state), scale_pointer,
+			    state.push_constant_variable, ConstantU32(state, 0),
+			    ConstantU32(state, state.input_info.pixel->raster_scale_dword + component));
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), scale_bits, scale_pointer);
+			state.builder.AddFunction(spv::OpBitcast, TypeF32(state), scale, scale_bits);
+			state.builder.AddFunction(spv::OpFMul, TypeF32(state), guest_value, value, scale);
+		}
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, guest_value);
 		return bits;
 	}
 	if (centroid || sample || kind == IR::StageInputKind::BaryCoordSmooth ||
@@ -523,6 +538,10 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const bool uint_output = MrtOutputMode(state, exp) == 7u;
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		    !uint_output && NanScrubEnabled()) {
+			value = ScrubNanF32Vector4(state, value);
+		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index == 0 && !uint_output &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {

@@ -131,6 +131,8 @@ public:
 		bool                        tess_active  = false;
 		bool                        mesh_active  = false;
 		bool                        pixel_active = false;
+		// Register state allows capturing geometry motion for temporal upscaling/FG.
+		bool                        motion_context = false;
 	};
 
 	// Asynchronous materializations submitted for one draw. Tasks stay owned by the draw until
@@ -152,7 +154,7 @@ public:
 	                        const HW::Context& context, const HW::UserConfig& user_config,
 	                        std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                        bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                        ShaderPixelInputInfo& pixel_info);
+	                        ShaderPixelInputInfo& pixel_info, bool allow_geometry_motion = false);
 	GraphicsPrograms ResolveGraphicsPrograms(const GraphicsPrepared&                  prepared,
 	                                         std::array<ShaderVertexInputInfo, 3>& vertex_info,
 	                                         ShaderPixelInputInfo&                 pixel_info);
@@ -190,12 +192,12 @@ public:
 	}
 
 	GraphicsPrograms
-	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
-	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
-	                    const HW::Context& context, const HW::UserConfig& user_config,
-	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	              GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
+	                                  const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+	                                  const HW::Context& context, const HW::UserConfig& user_config,
+	                                  std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                                  bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
+	                                  ShaderPixelInputInfo& pixel_info, bool allow_geometry_motion = false);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);

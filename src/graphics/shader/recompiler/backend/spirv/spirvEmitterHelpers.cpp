@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
@@ -246,6 +248,26 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	                          ConstantU32(state, state.program.wave_size));
 	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), ret, active, in_range);
 	return ret;
+}
+
+bool NanScrubEnabled() {
+	static const bool enabled = [] {
+		// On by default: in UFC 5 a NaN appearing every few minutes spread through the TAA history
+		// as a growing black area. KYTY_NAN_SCRUB=0 turns it off.
+		const char* env = std::getenv("KYTY_NAN_SCRUB");
+		return env == nullptr || env[0] != '0';
+	}();
+	return enabled;
+}
+
+uint32_t ScrubNanF32Vector4(EmitterState& state, uint32_t value) {
+	const auto vector_type = TypeF32Vector(state, 4);
+	const auto is_nan      = state.builder.AllocateId();
+	const auto scrubbed    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIsNan, TypeBoolVector(state, 4), is_nan, value);
+	state.builder.AddFunction(spv::OpSelect, vector_type, scrubbed, is_nan,
+	                          state.builder.Constant(spv::OpConstantNull, vector_type), value);
+	return scrubbed;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

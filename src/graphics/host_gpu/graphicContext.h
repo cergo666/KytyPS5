@@ -26,7 +26,9 @@ struct GraphicContext {
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
+	bool                               dlss_extensions_enabled               = false;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               conditional_rendering_enabled         = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
@@ -44,6 +46,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Same family as the renderer: no queue-family ownership transfers.
+	vk::Queue     present_queue = nullptr;
+	Common::Mutex present_queue_mutex;
+	uint32_t      present_queue_index = 0;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

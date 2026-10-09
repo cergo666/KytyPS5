@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rasterScale.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -17,7 +18,19 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()),
+      m_raster_scaler(std::make_unique<RasterScaler>(m_graphics, scheduler)) {}
+
+CommandBuffer::~CommandBuffer() = default;
+
+const RenderState& CommandBuffer::EffectiveRenderState() const {
+	return m_raster_scaler->State();
+}
+
+Image* CommandBuffer::RasterColorSource(const Image& image) const {
+	EndRendering();
+	return m_raster_scaler->ColorSource(image);
+}
 
 bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
@@ -60,13 +73,25 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg4      = arg4;
 }
 
-void CommandBuffer::BeginRendering(const RenderState& state) const {
-	if (m_rendering && m_render_state == state) {
+std::optional<RenderState> CommandBuffer::ActiveRenderState() const {
+	return m_rendering ? std::optional<RenderState>(m_render_state) : std::nullopt;
+}
+
+void CommandBuffer::BeginRendering(const RenderState& requested, bool preserve_attachments) const {
+	if (m_rendering && m_render_state == requested) {
+		m_raster_scaler->RefreshSourceVersions();
 		return;
 	}
+	EndRendering();
+	auto resumed = requested;
+	if (preserve_attachments) {
+		for (auto& attachment : resumed.color_attachments) attachment.is_clear = false;
+		resumed.depth_stencil_attachment.depth_clear = false;
+		resumed.depth_stencil_attachment.stencil_clear = false;
+	}
+	const auto& state = m_raster_scaler->Begin(Handle(), resumed);
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
-	EndRendering();
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -104,7 +129,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
-	m_render_state = state;
+	m_render_state = requested;
 	m_rendering    = true;
 }
 
@@ -114,6 +139,8 @@ void CommandBuffer::EndRendering() const {
 	}
 	Handle().endRendering();
 	m_rendering    = false;
+	m_raster_scaler->End(Handle());
+	m_context.GetGeometryMotion().EndPass(m_render_state);
 	m_render_state = {};
 }
 

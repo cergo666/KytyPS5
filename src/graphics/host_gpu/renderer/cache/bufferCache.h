@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -102,6 +103,22 @@ public:
 	[[nodiscard]] uint64_t BuffersGeneration() const {
 		return m_buffers_generation.load(std::memory_order_acquire);
 	}
+	// GPU-modified ranges nothing has written since MarkUnwritten; a later GPU write drops
+	// them (CPU writes clear the GPU-modified state instead).
+	void MarkUnwritten(uint64_t vaddr, uint64_t size) {
+		std::scoped_lock lock(m_unwritten_lock);
+		m_unwritten.Add(vaddr, size);
+	}
+	[[nodiscard]] bool IsUnwritten(uint64_t vaddr, uint64_t size) const {
+		std::scoped_lock lock(m_unwritten_lock);
+		return m_unwritten.Contains(vaddr, size);
+	}
+	// BDA stores choose addresses in the shader; serialize readback behind this tick.
+	void NoteUnknownWrite();
+	// Marks a range for the next SynchronizeBda. Any thread.
+	void AddBdaPending(uint64_t vaddr, uint64_t size);
+	// Uploads CPU writes made since the last call to the buffers inside `mapped`.
+	void               SynchronizeBda(const RangeSet& mapped);
 	void               RunGarbageCollector();
 	// Called after recording a draw or dispatch: the ranges bound for writing, and any address
 	// writes (which can reach untracked ranges), belong to the current command buffer.
@@ -141,6 +158,14 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void                     NoteCurrentWrite(uint64_t vaddr, uint64_t size);
+	// The GPU-written run around a guest read, clipped to its buffer.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> FaultAround(const Buffer& buffer, uint64_t vaddr,
+	                                                        uint64_t size) const;
+	// True when the recording command buffer neither writes the pages of the range nor
+	// defers a publish: a readback can then run ahead of it.
+	[[nodiscard]] bool CanReadAhead(uint64_t vaddr, uint64_t size);
+	void ReadAhead(Buffer& buffer, std::span<const vk::BufferCopy> copies, uint64_t total_size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -175,6 +200,16 @@ private:
 	std::mutex             m_known_fill_mutex;
 	std::vector<KnownFill> m_known_fills;
 	std::atomic<uint32_t>  m_known_fill_count {0};
+	RangeSet                                           m_unwritten;
+	mutable std::mutex                                 m_unwritten_lock;
+	RangeSet                                           m_current_writes; // in the recording tick
+	uint64_t                                           m_current_writes_tick = 0;
+	uint64_t                                           m_unknown_write_tick = 0;
+	std::unique_ptr<Buffer>                            m_ahead_readback;
+	// CPU-written ranges and new buffers since the last SynchronizeBda. Guest threads add
+	// write faults, so it has its own lock.
+	std::mutex                                        m_bda_pending_lock;
+	RangeSet                                          m_bda_pending;
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                          m_registration_epoch = 0;
 	StreamBuffer                                      m_staging_buffer;
