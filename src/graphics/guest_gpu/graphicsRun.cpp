@@ -23,6 +23,15 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -452,6 +461,13 @@ void GuestGpu::ThreadRun(void* data) {
 	CpSamplerStartIfEnabled();
 	PerfLog::RegisterThisThread("cp");
 	VkRecorder::EnableForThisThread();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// This thread alone turns the guest's command buffers into GPU work; keep it above the game's
+	// job workers (upstream PR #1050). KYTY_PRIO_BANDS=0 leaves it at normal priority.
+	if (const char* env = std::getenv("KYTY_PRIO_BANDS"); env == nullptr || env[0] != '0') {
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	}
+#endif
 	PerfLog::Start();
 
 	for (;;) {
@@ -735,11 +751,23 @@ static bool IsDeferSafePacket(cp_op_parser_func_t handler, uint32_t packet_heade
 	    handler == CpOpIndexType || handler == CpOpIndexBase || handler == CpOpIndexBufferSize ||
 	    handler == CpOpNumInstances || handler == CpOpSetBase || handler == CpOpDrawIndex ||
 	    handler == CpOpDrawIndexOffset || handler == CpOpDispatchDirect ||
-	    handler == CpOpDrawIndexAuto) {
+	    handler == CpOpDrawIndexAuto || handler == CpOpAcquireMem) {
 		return true;
+	}
+	if (handler == CpOpEventWrite) {
+		// Barrier events queue behind the deferred work (EmitGlobalBarrier). The occlusion-counter
+		// dump writes guest memory and still flushes.
+		static const bool defer_barrier = [] {
+			const char* env = std::getenv("KYTY_DEFER_BARRIER"); // opt-in: caused artifacts and lower FPS in UFC 5
+			return env != nullptr && env[0] == '1';
+		}();
+		return defer_barrier && (payload[0] & 0x3fu) != 0x39u;
 	}
 	if (handler == CpOpNop) {
 		const auto r = KYTY_PM4_R(packet_header & ~1u);
+		if (r == Pm4::R_ACQUIRE_MEM) {
+			return true;
+		}
 		if (r == Pm4::R_ZERO) {
 			// Plain padding; the 0x6875xxxx form is a marker with side effects.
 			return (payload[0] & 0xffff0000u) != 0x68750000u;
@@ -999,8 +1027,19 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
+	// The count and the arguments may have been written by the GPU (upstream PR #1136); publish
+	// those bytes to guest memory before reading them here. Only regions the GPU wrote are read back.
+	const auto sync_guest = [this](uint64_t vaddr, uint64_t size) {
+		auto& cache = m_renderer.GetBufferCache();
+		if (cache.IsRegionGpuModified(vaddr, size)) {
+			m_renderer.GetRenderExecutor().FlushDeferredDraws();
+			cache.ReadMemory(vaddr, size);
+		}
+	};
+
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		sync_guest(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t));
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
@@ -1062,6 +1101,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	sync_guest(m_draw_indirect_args_base_addr + data_offset,
+	           args_size + static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes);
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
@@ -1399,19 +1440,20 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
-	Common::LockGuard lock(m_renderer.GetMutex());
-
-	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	// KYTY_EVENT_BARRIER=0 drops the guest's cache/partial flushes entirely (experiment: the caches
+	// already order the hazards they track).
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_EVENT_BARRIER");
+		return env == nullptr || env[0] != '0';
+	}();
+	if (!enabled) {
+		return;
+	}
+	auto& executor = m_renderer.GetRenderExecutor();
+	if (executor.TryDeferBarrier()) {
+		return;
+	}
+	executor.RecordGlobalBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
