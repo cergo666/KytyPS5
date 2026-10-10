@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <map>
@@ -256,6 +257,8 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	std::chrono::steady_clock::time_point             m_usage_refreshed {};
+	std::chrono::steady_clock::time_point             m_gc_idle_until {};
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

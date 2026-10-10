@@ -36,6 +36,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include "graphics/host_gpu/cpWaitStats.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2120,6 +2121,7 @@ void RenderExecutor::FlushDeferredDraws() {
 			if (stage != nullptr && stage->task != nullptr) {
 				{
 					KYTY_PROFILER_BLOCK("Flush::WaitWorker");
+					KYTY_WAIT_SCOPE("flush.waitworker");
 					AsyncMaterializer::Wait(stage->task);
 				}
 				stage->valid = (queue.debug_flags & 1u) == 0 &&

@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/cpWaitStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderCheckpoint.h"
 
@@ -318,12 +319,14 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
+	KYTY_WAIT_SCOPE("sched.flushandwait");
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	KYTY_WAIT_SCOPE("sched.finish");
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -334,6 +337,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_WAIT_SCOPE("sched.wait");
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
