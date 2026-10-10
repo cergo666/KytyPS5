@@ -891,6 +891,7 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CMP_NEQ_F64:
 		case Decoder::Opcode::V_CMP_NLT_F64:
 		case Decoder::Opcode::V_CMP_TRU_F64:
+		case Decoder::Opcode::V_CMPX_F_F64:
 		case Decoder::Opcode::V_CMPX_LT_F64:
 		case Decoder::Opcode::V_CMPX_EQ_F64:
 		case Decoder::Opcode::V_CMPX_LE_F64:
@@ -905,26 +906,39 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CMPX_NLE_F64:
 		case Decoder::Opcode::V_CMPX_NEQ_F64:
 		case Decoder::Opcode::V_CMPX_NLT_F64:
-		case Decoder::Opcode::V_CMP_EQ_I64:
+		case Decoder::Opcode::V_CMPX_TRU_F64:
+		case Decoder::Opcode::V_CMP_F_I64:
 		case Decoder::Opcode::V_CMP_LT_I64:
+		case Decoder::Opcode::V_CMP_EQ_I64:
 		case Decoder::Opcode::V_CMP_LE_I64:
+		case Decoder::Opcode::V_CMP_GT_I64:
 		case Decoder::Opcode::V_CMP_NE_I64:
+		case Decoder::Opcode::V_CMP_GE_I64:
+		case Decoder::Opcode::V_CMP_T_I64:
+		case Decoder::Opcode::V_CMP_F_U64:
 		case Decoder::Opcode::V_CMP_LT_U64:
 		case Decoder::Opcode::V_CMP_EQ_U64:
 		case Decoder::Opcode::V_CMP_LE_U64:
 		case Decoder::Opcode::V_CMP_GT_U64:
 		case Decoder::Opcode::V_CMP_NE_U64:
 		case Decoder::Opcode::V_CMP_GE_U64:
+		case Decoder::Opcode::V_CMP_T_U64:
+		case Decoder::Opcode::V_CMPX_F_I64:
 		case Decoder::Opcode::V_CMPX_LT_I64:
 		case Decoder::Opcode::V_CMPX_EQ_I64:
 		case Decoder::Opcode::V_CMPX_LE_I64:
+		case Decoder::Opcode::V_CMPX_GT_I64:
 		case Decoder::Opcode::V_CMPX_NE_I64:
+		case Decoder::Opcode::V_CMPX_GE_I64:
+		case Decoder::Opcode::V_CMPX_T_I64:
+		case Decoder::Opcode::V_CMPX_F_U64:
 		case Decoder::Opcode::V_CMPX_LT_U64:
 		case Decoder::Opcode::V_CMPX_EQ_U64:
 		case Decoder::Opcode::V_CMPX_LE_U64:
 		case Decoder::Opcode::V_CMPX_GT_U64:
 		case Decoder::Opcode::V_CMPX_NE_U64:
 		case Decoder::Opcode::V_CMPX_GE_U64:
+		case Decoder::Opcode::V_CMPX_T_U64:
 			include_vector(inst.src0, 2u);
 			include_vector(inst.src1, 2u);
 			break;
@@ -1382,7 +1396,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	                              (options.input_info.compute->float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
 		auto*      block = blocks_by_id.at(cfg_block.id);
-		Translator translator(result, block, vector_limit, flush_f32_inputs);
+		Translator translator(result, block, vector_limit, flush_f32_inputs,
+		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

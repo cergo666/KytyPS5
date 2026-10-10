@@ -295,16 +295,52 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct Permutation {
+		std::vector<uint32_t>                       function_code;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 	};
 
 	struct SourceEntry {
-		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
+		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
+		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
 		}
 
+		std::span<const uint32_t> FunctionCode() const {
+			return call_source
+			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
+			    : std::span<const uint32_t>{};
+		}
+
+		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			const auto revision = call_source->revision;
+			ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
+			resource_plan.source_reads = call_source->reads;
+			return revision != call_source->revision;
+		}
+
+		template <bool HasCalls>
+		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                             uint32_t push_data_cursor) {
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, runtime, resources, specialization));
+			for (auto& candidate: permutations) {
+				const auto& layout = candidate.program.bindings;
+				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
+				        push_data_cursor, layout.ShaderDataDwords()) ||
+				    candidate.specialization != specialization) {
+					continue;
+				}
+				if constexpr (HasCalls) {
+					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+				}
+				return &candidate;
+			}
+			return nullptr;
+		}
+
+		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -412,14 +448,10 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) const {
-		std::optional<ShaderRecompiler::CompileResult> result_holder;
-		{
-			KYTY_PROFILER_BLOCK("SC::CompileProgram");
-			result_holder.emplace(ShaderRecompiler::CompileProgram(std::move(translated), options,
-			                                                       specialization, push_data_start_dword));
-		}
-		auto& result = *result_holder;
+	                               uint32_t push_data_start_dword,
+	                               std::span<const uint32_t> function_code) const {
+		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
@@ -438,6 +470,7 @@ struct PipelineCache::ProgramCache {
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
 		return {
+		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = 0, .module = module},
@@ -474,25 +507,18 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
+		bool source_changed = false;
 		if (entry != programs.end()) {
-			{
-				KYTY_PROFILER_BLOCK("PC::Materialize(hit)");
-				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-				    entry->second.resource_plan, runtime, entry->second.resources,
-				    entry->second.specialization));
+			auto& cached = entry->second;
+			Permutation* permutation = nullptr;
+			if (cached.call_source) {
+				source_changed = cached.RefreshCallSource(runtime);
+				if (!source_changed) permutation = cached.template FindPermutation<true>(runtime, push_data_cursor);
+			} else {
+				permutation = cached.template FindPermutation<false>(runtime, push_data_cursor);
 			}
-			KYTY_PROFILER_BLOCK("PC::FindPermutation");
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
-				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &entry->second.resources};
+			if (permutation != nullptr) {
+				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -501,26 +527,46 @@ struct PipelineCache::ProgramCache {
 		const auto options    = MakeOptions(params.hash, user_data, params.back_code, input_info);
 		const auto stage_name = GetStageNames(stage).name;
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
-		std::optional<ShaderRecompiler::TranslateResult> translated_holder;
-		{
-			KYTY_PROFILER_BLOCK("SC::Translate");
-			translated_holder.emplace(ShaderRecompiler::TranslateProgram(params.code, options));
+		ShaderRecompiler::ShaderSource source;
+		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
+		ShaderRecompiler::TranslateResult translated;
+		if (current != nullptr) {
+			if (current->call) {
+				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+				translated.program.source_reads = current->reads;
+			} else {
+				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+			}
+		} else {
+			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
-		auto& translated = *translated_holder;
 		if (entry == programs.end()) {
-			KYTY_PROFILER_BLOCK("SC::ExtractPlan");
+			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
+		} else if (source_changed) {
+			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			if (const auto* permutation = entry->second.template FindPermutation<true>(runtime, push_data_cursor)) {
+				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
+				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				return permutation->handle;
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    entry->second.FunctionCode()));
 		auto& permutation     = entry->second.permutations.back();
 		permutation.handle.id = ++next_shader_id;
 		// Only programs that compiled are recorded, so a cache never fails earlier than a draw.
-		Record(params, input_info, permutation.specialization, push_data_cursor);
+		// Programs linked to callee code are not replayable from the recorded inputs.
+		if (!entry->second.call_source) {
+			Record(params, input_info, permutation.specialization, push_data_cursor);
+		}
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 		{
@@ -567,7 +613,8 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		const auto entry = programs.find(lookup_key);
-		if (entry == programs.end() || !entry->second.resource_plan.resource_tracking_complete) {
+		if (entry == programs.end() || entry->second.call_source ||
+		    !entry->second.resource_plan.resource_tracking_complete) {
 			return {};
 		}
 		auto* task = async.Acquire();
@@ -719,7 +766,7 @@ struct PipelineCache::ProgramCache {
 			plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
 		}
 		return CompilePermutation(stage_name, options, std::move(translated), recipe.specialization,
-		                          recipe.push_data_start);
+		                          recipe.push_data_start, {});
 	}
 
 	// Compiles every recipe of one source key; safe on any thread.
@@ -747,7 +794,7 @@ struct PipelineCache::ProgramCache {
 			return std::nullopt;
 		}
 		std::optional<SourceEntry> entry;
-		entry.emplace(std::move(*plan));
+		entry.emplace(std::move(*plan), nullptr);
 		entry->permutations.assign(std::make_move_iterator(permutations.begin()),
 		                           std::make_move_iterator(permutations.end()));
 		return entry;

@@ -208,9 +208,9 @@ public:
 	void               RecordGlobalBarrier();
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode);
+	                      uint32_t mode, bool async_compute);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
@@ -225,7 +225,7 @@ public:
 private:
 	void DispatchDirectImpl(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                        uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
-	                        DeferredDraw* deferred);
+	                        bool async_compute, DeferredDraw* deferred);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawIndexImpl(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
 	                   DeferredDraw* deferred);
