@@ -1,11 +1,51 @@
 #include "graphics/perfLog.h"
 
 #include <atomic>
+#include <cstdlib>
 
 namespace Libs::Graphics::PerfLog {
 
 namespace {
 std::atomic<unsigned long long> g_frames {0};
+std::atomic<unsigned>           g_shadow_every {1};
+}
+
+unsigned RecommendedShadowEvery() {
+	return g_shadow_every.load(std::memory_order_relaxed);
+}
+
+void AdaptiveQuality(double fps) {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_ADAPTIVE_SHADOWS");
+		return env == nullptr || env[0] != '0';
+	}();
+	if (!enabled || fps < 5.0) { // loading and menus' transitions say nothing about the scene
+		return;
+	}
+	static const double low = [] {
+		const char* env = std::getenv("KYTY_ADAPTIVE_LOW");
+		return env != nullptr ? std::atof(env) : 22.0;
+	}();
+	static const double high = [] {
+		const char* env = std::getenv("KYTY_ADAPTIVE_HIGH");
+		return env != nullptr ? std::atof(env) : 33.0;
+	}();
+	static unsigned level = 1, low_count = 0, high_count = 0;
+	if (fps < low) {
+		low_count++;
+		high_count = 0;
+	} else if (fps >= high) {
+		high_count++;
+		low_count = 0;
+	} else {
+		low_count = high_count = 0;
+	}
+	if (level == 1 && low_count >= 2) {
+		level = 2;
+	} else if (level == 2 && high_count >= 2) {
+		level = 1;
+	}
+	g_shadow_every.store(level, std::memory_order_relaxed);
 }
 
 void CountFrame() {
@@ -200,6 +240,7 @@ void Run() {
 		const auto frames = g_frames.load(std::memory_order_relaxed);
 		const double fps  = static_cast<double>(frames - last_frames) / elapsed;
 		last_frames       = frames;
+		AdaptiveQuality(fps);
 
 		FILETIME idle, kernel, user;
 		GetSystemTimes(&idle, &kernel, &user);

@@ -125,7 +125,10 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command, bool ordered)
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
-	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
+	// A burst of commands (guest threads retrying faults) must not keep the command processor
+	// from submitting GPU work that those commands may be waiting for.
+	for (uint32_t budget = 32; budget != 0 && m_pending_commands.load(std::memory_order_acquire) != 0;
+	     --budget) {
 		Common::UniqueFunction<void> command;
 		{
 			Common::LockGuard lock(m_queue_mutex);
