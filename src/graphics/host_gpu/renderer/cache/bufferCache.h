@@ -11,7 +11,12 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <semaphore>
+#include <thread>
 #include <array>
 #include <atomic>
 #include <map>
@@ -84,7 +89,14 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// Address span covered by GPU-modified bytes; false when there are none.
 	[[nodiscard]] bool GpuDirtyBounds(uint64_t& low, uint64_t& high) const {
-		return m_gpu_modified_ranges.Bounds(low, high);
+		uint64_t inflight_low = 0, inflight_high = 0;
+		const bool dirty    = m_gpu_modified_ranges.Bounds(low, high);
+		const bool inflight = m_inflight_ranges.Bounds(inflight_low, inflight_high);
+		if (inflight) {
+			low  = dirty ? std::min(low, inflight_low) : inflight_low;
+			high = dirty ? std::max(high, inflight_high) : inflight_high;
+		}
+		return dirty || inflight;
 	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -187,8 +199,51 @@ private:
 	[[nodiscard]] bool CanReadAhead(uint64_t vaddr, uint64_t size);
 	void ReadAhead(Buffer& buffer, std::span<const vk::BufferCopy> copies, uint64_t total_size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
+	// With a `waiter`, a fault read may be deferred: the copy is submitted and the function
+	// returns with *deferred set; the waiter is released once the data is published.
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        std::binary_semaphore* waiter = nullptr,
+	                                        bool*                  deferred = nullptr);
+
+	// Fault readbacks that do not block the command processor (KYTY_NO_ASYNC_READBACK=1 off): the
+	// copy runs on the readback queue, a completer thread publishes it to guest memory, and the
+	// GPU thread then releases the pages and the waiting guest threads. GPU thread unless noted.
+	struct AsyncReadback;
+	static constexpr size_t   kAsyncSlots     = 8;
+	static constexpr uint64_t kAsyncSlotBytes = 2ull * 1024 * 1024;
+	struct AsyncSlot {
+		vk::CommandPool   pool;
+		vk::CommandBuffer cmd;
+		vk::Fence         fence;
+		bool              busy = false;
+	};
+	[[nodiscard]] static bool AsyncReadbackEnabled();
+	[[nodiscard]] bool        TryStartAsyncReadback(
+	           Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t buffer_address,
+	           std::vector<vk::BufferCopy>& copies,
+	           uint64_t total_size, uint64_t writer_tick,
+	           const std::vector<std::pair<uint64_t, uint64_t>>& neighbours,
+	           std::binary_semaphore*                              waiter);
+	// A pending readback already covers the page: the waiter is released when it completes.
+	[[nodiscard]] bool JoinAsyncReadback(uint64_t vaddr, uint64_t size, std::binary_semaphore* waiter);
+	// Waits for the publication of pending readbacks overlapping [begin, end) and finishes them.
+	void FlushAsyncReadbacks(uint64_t begin, uint64_t end);
+	void FinalizeAsyncReadback(const std::shared_ptr<AsyncReadback>& readback);
+	void PublishAsyncReadback(AsyncReadback& readback);
+	void ReleaseNotRedirtied(uint64_t begin, uint64_t end);
+	// Bytes of started readbacks whose data is not in guest memory yet (GPU thread only). They
+	// still count as GPU-dirty for readers of guest memory.
+	RangeSet m_inflight_ranges;
+	void AsyncReadbackThread(std::stop_token stop);
+	void DrainAsyncReadbacks();
+	std::array<AsyncSlot, kAsyncSlots>               m_async_slots {};
+	std::unique_ptr<Buffer>                          m_async_staging;
+	bool                                             m_async_ready = false;
+	std::mutex                                       m_async_mutex;
+	std::condition_variable                          m_async_cv;
+	std::deque<std::shared_ptr<AsyncReadback>>       m_async_pending;
+	std::jthread                                     m_async_thread;
 	// GPU writes of the current command buffer, and bound writes not recorded yet.
 	void               MarkUnsubmittedWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasPendingWrite(uint64_t vaddr, uint64_t size) const;
