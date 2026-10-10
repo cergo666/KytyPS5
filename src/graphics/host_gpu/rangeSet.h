@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -16,7 +18,8 @@ public:
 	// per 64 KiB block says whether any range touches it, so most negative Intersects() queries
 	// avoid walking the tree. Addresses at or above kFilterLimit always take the exact path.
 	void EnableFilter() {
-		if (m_filter.empty()) {
+		static const bool disabled = std::getenv("KYTY_NO_RANGE_FILTER") != nullptr;
+		if (m_filter.empty() && !disabled) {
 			m_filter.assign(kFilterWords, 0);
 			for (const auto& [begin, last]: m_ranges) {
 				FilterSet(begin, last);
@@ -93,8 +96,17 @@ public:
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
 		if (!FilterMayIntersect(address, end)) {
+			static const bool verify = std::getenv("KYTY_VERIFY_RANGE") != nullptr;
+			if (verify && IntersectsExact(address, end)) {
+				std::printf("RANGEFILTER MISMATCH address=0x%llx size=0x%llx\n",
+				            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
+			}
 			return false;
 		}
+		return IntersectsExact(address, end);
+	}
+
+	[[nodiscard]] bool IntersectsExact(uint64_t address, uint64_t end) const {
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
 			return true;

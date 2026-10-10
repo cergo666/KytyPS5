@@ -40,6 +40,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1262,6 +1263,66 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	{
+		// KYTY_DIAG_RUNS=1: how often consecutive draws repeat pipeline, targets and bindings.
+		static const bool diag = std::getenv("KYTY_DIAG_RUNS") != nullptr;
+		if (diag) {
+			struct Prev {
+				const void* pipeline = nullptr;
+				uint64_t targets = 0, images = 0, buffers = 0;
+				uint64_t run = 0;
+			};
+			static Prev prev;
+			static uint64_t n = 0, same_pipe = 0, same_targets = 0, same_both = 0, same_images = 0,
+			                same_buffers = 0, same_all = 0, runs = 0, run_total = 0, push_only = 0;
+			static auto last = std::chrono::steady_clock::now();
+			uint64_t targets = 1469598103934665603ull, images = targets, buffers = targets;
+			const auto mix = [](uint64_t& h, uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+			for (uint32_t i = 0; i < state.color_count; ++i) {
+				mix(targets, state.color_info[i].image_id.index);
+			}
+			mix(targets, state.depth_info.image_id.index);
+			for (const auto* stage: stages) {
+				for (const auto& t: stage->images) {
+					mix(images, t.image_id.index);
+					mix(images, reinterpret_cast<uintptr_t>(static_cast<VkImageView>(t.image_view)));
+				}
+				for (const auto& b: stage->buffer_sources) {
+					mix(buffers, b.id.index);
+					mix(buffers, b.address);
+					mix(buffers, b.size);
+				}
+			}
+			const void* pipe = &pipeline;
+			++n;
+			const bool sp = pipe == prev.pipeline, st = targets == prev.targets;
+			const bool si = images == prev.images, sb = buffers == prev.buffers;
+			same_pipe += sp;
+			same_targets += st;
+			same_both += sp && st;
+			same_images += si;
+			same_buffers += sb;
+			same_all += sp && st && si && sb;
+			push_only += sp && st && si && !sb;
+			if (sp) { ++prev.run; } else { ++runs; run_total += prev.run + 1; prev.run = 0; }
+			prev.pipeline = pipe; prev.targets = targets; prev.images = images; prev.buffers = buffers;
+			const auto now = std::chrono::steady_clock::now();
+			if (now - last > std::chrono::seconds(10)) {
+				last = now;
+				const double d = static_cast<double>(n);
+				std::printf("RUNDIAG draws=%llu same_pipeline=%.1f%% same_targets=%.1f%% pipe+targets=%.1f%% "
+				            "same_images=%.1f%% same_buffers=%.1f%% all_same=%.1f%% images_same_buffers_diff=%.1f%% "
+				            "avg_pipeline_run=%.2f\n",
+				            static_cast<unsigned long long>(n), 100 * same_pipe / d, 100 * same_targets / d,
+				            100 * same_both / d, 100 * same_images / d, 100 * same_buffers / d,
+				            100 * same_all / d, 100 * push_only / d,
+				            runs ? static_cast<double>(run_total) / runs : 0.0);
+				std::fflush(stdout);
+				n = same_pipe = same_targets = same_both = same_images = same_buffers = same_all = 0;
+				runs = run_total = push_only = 0;
+			}
+		}
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
 	                                      state.depth_info, feedback_aspects, stages);
