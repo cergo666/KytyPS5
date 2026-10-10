@@ -1818,9 +1818,12 @@ static bool ShadowFilterSkips(const HW::Context& ctx, const HW::Shader& sh, uint
 		c.any       = c.off || c.every > 1 || c.min_prims > 0;
 		return c;
 	}();
-	if (!config.any) {
+	// The adaptive controller (PerfLog) asks for every second frame while the game runs slowly.
+	const uint32_t adaptive_every = PerfLog::RecommendedShadowEvery();
+	if (!config.any && adaptive_every <= 1) {
 		return false;
 	}
+	const uint32_t every = std::max(config.every, adaptive_every);
 	static bool     in_run      = false;
 	static bool     run_skipped = false;
 	static uint64_t skipped = 0, kept = 0;
@@ -1837,8 +1840,7 @@ static bool ShadowFilterSkips(const HW::Context& ctx, const HW::Shader& sh, uint
 	}
 	if (!in_run) {
 		in_run      = true;
-		run_skipped = config.off || (config.every > 1 &&
-		                             PerfLog::FrameCount() % config.every != 0);
+		run_skipped = config.off || (every > 1 && PerfLog::FrameCount() % every != 0);
 	}
 	bool skip = run_skipped;
 	if (!skip && config.min_prims != 0 &&

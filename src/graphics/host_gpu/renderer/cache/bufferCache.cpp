@@ -922,19 +922,27 @@ bool BufferCache::JoinAsyncReadback(uint64_t vaddr, uint64_t size, std::binary_s
 	if (m_async_pending.empty()) {
 		return false;
 	}
-	const auto overlaps = [&](uint64_t begin, uint64_t end) {
-		return begin < vaddr + size && vaddr < end;
+	// Pages, not bytes: a page stays protected until the readback that covers any part of it ends,
+	// and retrying the access earlier would only fault again.
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	const auto overlaps   = [&](uint64_t begin, uint64_t end) {
+		return Common::AlignDown(begin, TRACKER_PAGE_SIZE) < page_end &&
+		       page_begin < Common::AlignUp(end, TRACKER_PAGE_SIZE);
 	};
 	std::lock_guard lock(m_async_mutex);
 	for (auto& readback: m_async_pending) {
 		if (readback->finalized) {
 			continue;
 		}
-		for (const auto& [begin, end]: readback->release) {
-			if (overlaps(begin, end)) {
-				readback->waiters.push_back(waiter);
-				return true;
-			}
+		const auto hit = [&](const auto& ranges) {
+			return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+				return overlaps(range.first, range.second);
+			});
+		};
+		if (hit(readback->release) || hit(readback->inflight)) {
+			readback->waiters.push_back(waiter);
+			return true;
 		}
 	}
 	return false;
@@ -980,7 +988,7 @@ void BufferCache::ReleaseNotRedirtied(uint64_t begin, uint64_t end) {
 		open = false;
 	};
 	for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
-		if (m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+		if (HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
 			flush(page);
 		} else if (!open) {
 			run  = page;
@@ -1127,8 +1135,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 			std::tie(vaddr, size) = FaultAround(buffer, vaddr, size);
 			bool deferred = false;
-			if (DownloadBufferMemory<false>(buffer, vaddr, size, &done, &deferred) && !deferred) {
-				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			if (DownloadBufferMemory<false>(buffer, vaddr, size, &done, &deferred)) {
+				if (!deferred) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+				}
+			} else {
+				// Nothing left to copy (another readback took it): pages without dirty bytes must
+				// not stay protected, or the faulting thread would retry forever.
+				ReleaseNotRedirtied(vaddr, vaddr + size);
 			}
 			if (!deferred) {
 				done.release();
