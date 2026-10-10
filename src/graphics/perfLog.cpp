@@ -23,6 +23,7 @@ unsigned long long FrameCount() {
 #include <windows.h>
 
 #include <psapi.h>
+#include <tlhelp32.h>
 
 #include <chrono>
 #include <cstdio>
@@ -47,6 +48,14 @@ struct TrackedThread {
 std::mutex                 g_threads_mutex;
 std::vector<TrackedThread> g_threads;
 
+const char* ThreadLabel(DWORD id) {
+	std::lock_guard lock(g_threads_mutex);
+	for (const auto& thread: g_threads) {
+		if (GetThreadId(thread.handle) == id) return thread.label.c_str();
+	}
+	return nullptr;
+}
+
 double FileTimeSeconds(const FILETIME& ft) {
 	ULARGE_INTEGER v;
 	v.LowPart  = ft.dwLowDateTime;
@@ -61,6 +70,65 @@ double ThreadCpuSeconds(HANDLE thread) {
 	}
 	return FileTimeSeconds(kernel) + FileTimeSeconds(user);
 }
+
+// Per-thread CPU census (perf_threads.csv: t_s,tid,name,pct), threads above 2% of a core.
+const char* ThreadLabel(DWORD id);
+
+void WriteThreadCensus(FILE* out, double t_s, double elapsed,
+                       std::vector<std::pair<DWORD, double>>& previous) {
+	const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	THREADENTRY32 entry {};
+	entry.dwSize = sizeof(entry);
+	const DWORD pid = GetCurrentProcessId();
+	std::vector<std::pair<DWORD, double>> now;
+	if (Thread32First(snapshot, &entry)) {
+		do {
+			if (entry.th32OwnerProcessID != pid) {
+				continue;
+			}
+			HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+			if (thread == nullptr) {
+				continue;
+			}
+			FILETIME create, exit_time, kernel, user;
+			if (GetThreadTimes(thread, &create, &exit_time, &kernel, &user)) {
+				const double cpu = FileTimeSeconds(kernel) + FileTimeSeconds(user);
+				now.emplace_back(entry.th32ThreadID, cpu);
+				double before = 0;
+				for (const auto& [id, value]: previous) {
+					if (id == entry.th32ThreadID) {
+						before = value;
+						break;
+					}
+				}
+				const double pct = 100.0 * (cpu - before) / elapsed;
+				if (pct >= 2.0) {
+					char       name[128] = "";
+					PWSTR      description = nullptr;
+					if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+						WideCharToMultiByte(CP_UTF8, 0, description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+						LocalFree(description);
+					}
+					if (name[0] == 0) {
+						if (const char* label = ThreadLabel(entry.th32ThreadID); label != nullptr) {
+							std::snprintf(name, sizeof(name), "%s", label);
+						}
+					}
+					std::fprintf(out, "%.0f,%lu,%s,%.0f\n", t_s, static_cast<unsigned long>(entry.th32ThreadID),
+					             name, pct);
+				}
+			}
+			CloseHandle(thread);
+		} while (Thread32Next(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+	previous = std::move(now);
+	std::fflush(out);
+}
+
 
 // Minimal NVML binding (nvml.dll ships with the NVIDIA driver); every call may be unavailable.
 struct NvmlUtilization {
@@ -103,6 +171,11 @@ void Run() {
 	if (out == nullptr) {
 		return;
 	}
+	FILE* census = std::fopen("perf_threads.csv", "w");
+	if (census != nullptr) {
+		std::fprintf(census, "t_s,tid,name,pct\n");
+	}
+	std::vector<std::pair<DWORD, double>> census_previous;
 	std::fprintf(out, "t_s,fps,cpu_total_pct,proc_cpu_pct,cp_thread_pct,gpu_pct,vram_used_mb,ram_mb\n");
 	std::fflush(out);
 
@@ -169,6 +242,10 @@ void Run() {
 		             have_mem ? static_cast<int>(mem.used / (1024 * 1024)) : -1,
 		             static_cast<int>(counters.WorkingSetSize / (1024 * 1024)));
 		std::fflush(out);
+		if (census != nullptr) {
+			WriteThreadCensus(census, std::chrono::duration<double>(now - start).count(), elapsed,
+			                  census_previous);
+		}
 	}
 }
 

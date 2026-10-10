@@ -1155,6 +1155,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable, uint64_t gpu_args_addr) {
 	KYTY_PROFILER_BLOCK("Draw::ExecutePreparedDraw");
+	KYTY_WAIT_SCOPE("x.total");
+	const char* draw_category = "cat.color.small";
+	if (CpWaitStats::Enabled()) {
+		const auto& depth_extent = state.depth_info.desc.info.extent;
+		if (state.color_count == 0) {
+			draw_category = depth_extent.width == depth_extent.height && depth_extent.width >= 1023
+			                    ? "cat.depth.square"
+			                    : "cat.depth.other";
+		} else {
+			draw_category = state.color_info[0].Extent().width >= 1500 ? "cat.color.big"
+			                                                              : "cat.color.small";
+		}
+	}
+	KYTY_WAIT_SCOPE(draw_category);
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -1221,20 +1235,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
-	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-		descriptor_stages[stage_count++] = &bindings.vertex[i];
-	}
-	if (state.ps_active) {
-		if (!bindings.pixel) bindings.pixel.emplace();
-		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
-		descriptor_stages[stage_count++] = &*bindings.pixel;
+	{
+		KYTY_WAIT_SCOPE("x.preparebindings");
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+			descriptor_stages[stage_count++] = &bindings.vertex[i];
+		}
+		if (state.ps_active) {
+			if (!bindings.pixel) bindings.pixel.emplace();
+			PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
+			descriptor_stages[stage_count++] = &*bindings.pixel;
+		}
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	{
+		KYTY_WAIT_SCOPE("x.preparegraphicsbindings");
+		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
+		KYTY_WAIT_SCOPE("x.vertexindex");
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
@@ -1260,6 +1281,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	KYTY_WAIT_SCOPE("x.pipeline+targets");
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
@@ -1885,6 +1907,7 @@ bool RenderExecutor::TryDeferGraphics(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	KYTY_PROFILER_BLOCK("Defer::Checks");
+	KYTY_WAIT_SCOPE("defer.total");
 	const auto& ctx  = buffer.GetRegisters();
 	const auto& ucfg = buffer.GetUserConfig();
 	const auto& sh   = buffer.GetShaders();
@@ -1896,11 +1919,17 @@ bool RenderExecutor::TryDeferGraphics(uint64_t submit_id, CommandBuffer& buffer,
 		return false;
 	}
 
-	if (ShadowFilterSkips(ctx, sh, is_indexed ? indexed->index_count : automatic->vertex_count,
-	                      instances)) {
+	bool shadow_skip = false;
+	{
+		KYTY_WAIT_SCOPE("defer.shadow");
+		shadow_skip = ShadowFilterSkips(ctx, sh, is_indexed ? indexed->index_count : automatic->vertex_count,
+		                                instances);
+	}
+	if (shadow_skip) {
 		return true; // consumed without drawing
 	}
 	if (queue.count == DeferredDrawQueue::kCapacity) {
+		KYTY_WAIT_SCOPE("flush.cap");
 		FlushDeferredDraws();
 	}
 	auto& slot = queue.slots[(queue.head + queue.count) % DeferredDrawQueue::kCapacity];
@@ -1917,30 +1946,40 @@ bool RenderExecutor::TryDeferGraphics(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	{
 		KYTY_PROFILER_BLOCK("Defer::Snapshot");
+		KYTY_WAIT_SCOPE("defer.snapshot");
 		draw.ctx = ctx;
 		draw.ucfg = ucfg;
 		draw.sh = sh;
 	}
 
 	const auto& regs             = draw.ctx;
-	const auto  color_output_mask = DrawColorOutputMask(regs);
-	draw.ps_active = draw.sh.GetPs().ps_regs.data_addr != 0 &&
-	                 (color_output_mask != 0 ||
-	                  PixelShaderHasDepthOrCoverageSideEffects(regs.GetShaderRegisters()));
+	uint32_t    color_output_mask = 0;
+	{
+		KYTY_WAIT_SCOPE("defer.psactive");
+		color_output_mask = DrawColorOutputMask(regs);
+		draw.ps_active = draw.sh.GetPs().ps_regs.data_addr != 0 &&
+		                 (color_output_mask != 0 ||
+		                  PixelShaderHasDepthOrCoverageSideEffects(regs.GetShaderRegisters()));
+	}
 	{
 		KYTY_PROFILER_BLOCK("Defer::Reset");
 		draw.vertex_info = {};
 		draw.ps_info     = {};
 	}
-	const auto mapping = ComputeTargetExportMapping(regs, color_output_mask);
+	const auto mapping = [&] {
+		KYTY_WAIT_SCOPE("defer.mapping");
+		return ComputeTargetExportMapping(regs, color_output_mask);
+	}();
 	{
 		KYTY_PROFILER_BLOCK("Defer::Prepare");
+		KYTY_WAIT_SCOPE("defer.prepare");
 		draw.prepared = pipeline.PrepareGraphicsPrograms(
 		    draw.sh.GetVs(), draw.sh.GetPs(), regs.GetShaderRegisters(), regs, draw.ucfg, mapping,
 		    draw.ps_active, draw.vertex_info, draw.ps_info);
 	}
 	{
 		KYTY_PROFILER_BLOCK("Defer::Submit");
+		KYTY_WAIT_SCOPE("defer.submit");
 		pipeline.SubmitGraphicsAsync(draw.prepared, draw.vertex_info, draw.ps_info,
 		                             m_context.GetBufferCache().GpuDirtyClearEpoch(), draw.async);
 	}
@@ -2102,6 +2141,7 @@ void RenderExecutor::FlushDeferredDraws() {
 		return;
 	}
 	KYTY_PROFILER_BLOCK("Draw::FlushDeferred");
+	KYTY_WAIT_SCOPE("flush.all");
 	auto& queue    = *m_deferred;
 	queue.flushing = true;
 	auto& pipeline = m_context.GetPipelineCache();

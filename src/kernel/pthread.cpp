@@ -1,3 +1,4 @@
+#include "graphics/perfLog.h"
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
@@ -3272,6 +3273,7 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	Libs::Graphics::PerfLog::RegisterThisThread(("g:" + thread->name).c_str());
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// Apply the guest's priority to this thread directly (upstream PR #1050). The attribute carries
 	// it as well, but whether winpthreads honours it at creation is not ours to rely on.

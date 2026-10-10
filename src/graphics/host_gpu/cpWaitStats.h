@@ -14,7 +14,7 @@ namespace Libs::Graphics {
 // prints "WAITDIAG name count total_ms max_ms" for each every 10 s.
 class CpWaitStats {
 public:
-	static constexpr int kMax = 32;
+	static constexpr int kMax = 64;
 
 	struct Slot {
 		const char*           name = nullptr;

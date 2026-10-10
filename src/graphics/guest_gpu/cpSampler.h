@@ -7,6 +7,8 @@ namespace Libs::Graphics {
 // millisecond it records the thread's call stack and, every few seconds, writes the hottest
 // functions and source lines to cp_samples_<n>.txt next to the working directory.
 void CpSamplerStartIfEnabled();
+// The same for another thread: enabled by the environment variable, reports in <prefix>_<n>.txt.
+void CpSamplerStartIfEnabled(const char* env_name, const char* file_prefix);
 
 } // namespace Libs::Graphics
 

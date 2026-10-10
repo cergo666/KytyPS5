@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/perfLog.h"
 #include "graphics/host_gpu/cpWaitStats.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderCheckpoint.h"
@@ -456,6 +457,7 @@ bool CommandScheduler::HasPendingPriorityOperations(GuestRange range) {
 /// Publish the active range under the queue lock before popping becomes observable,
 /// and retain it through the callback so concurrent unmap queries cannot miss writeback.
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	Libs::Graphics::PerfLog::RegisterThisThread("prio");
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
