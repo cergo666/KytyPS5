@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/cpWaitStats.h"
 #include "graphics/host_gpu/vulkanRecorder.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -199,12 +200,14 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		KYTY_WAIT_SCOPE("unmap.total");
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		if (m_command_scheduler.Active() &&
 		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
 		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
 		     m_command_scheduler.HasPendingPriorityOperations({vaddr, size}))) {
+			KYTY_WAIT_SCOPE("unmap.finish");
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -225,6 +228,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda(bool has_address_writes) {
+	KYTY_WAIT_SCOPE("prepare.bda");
 	KYTY_PROFILER_BLOCK("Draw::PrepareBda");
 	if (has_address_writes) {
 		m_buffer_cache.NoteUnknownWrite();
@@ -247,8 +251,14 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
-	m_texture_cache.RunGarbageCollector();
-	m_buffer_cache.RunGarbageCollector();
+	{
+		KYTY_WAIT_SCOPE("gc.textures");
+		m_texture_cache.RunGarbageCollector();
+	}
+	{
+		KYTY_WAIT_SCOPE("gc.buffers");
+		m_buffer_cache.RunGarbageCollector();
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

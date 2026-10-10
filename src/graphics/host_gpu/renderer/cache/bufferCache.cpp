@@ -7,6 +7,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/cpWaitStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -178,6 +179,7 @@ static bool ReadbackDiagEnabled() {
 /// waits for the GPU and earlier priority callbacks before writing guest backing.
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_WAIT_SCOPE(async ? "download.async" : "download.sync");
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -301,6 +303,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (detached) {
 		// The barrier orders the copy after every submitted command; no unsubmitted one writes
 		// these ranges. Recorded here, before the copy list moves into the publish step.
+		KYTY_WAIT_SCOPE("download.submit");
 		m_scheduler.SubmitDetached(record, m_scheduler.HasReadbackQueue()
 		                                       ? std::optional<uint64_t>(writer_tick)
 		                                       : std::nullopt);
@@ -329,6 +332,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		const auto copied = std::chrono::steady_clock::now();
+		KYTY_WAIT_SCOPE("download.order+publish");
 		if (detached) {
 			// Nothing is deferred at the current tick. Older publications of these bytes go first;
 			// unrelated ones (labels, flips, other downloads) need not be waited for.
@@ -1106,8 +1110,14 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
+	// The collector runs around 5000 times a second; the heap budget query takes the allocator lock
+	// and costs ~10 us, so it is refreshed at most every 20 ms (memory pressure moves slowly).
 	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_usage_refreshed >= std::chrono::milliseconds(20)) {
+			m_usage_refreshed   = now;
+			m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		}
 	}
 	static const bool gc_log = [] {
 		const char* env = std::getenv("KYTY_GC_LOG");
@@ -1125,6 +1135,13 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	// Above the trigger the scan re-visits the same old dirty buffers on every call (thousands of
+	// times a second, ~10 us each). After a scan that retired nothing, outside memory pressure,
+	// the next one waits 2 ms.
+	const auto scan_time = std::chrono::steady_clock::now();
+	if (!aggressive && scan_time < m_gc_idle_until) {
+		return;
+	}
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
@@ -1148,6 +1165,9 @@ void BufferCache::RunGarbageCollector() {
 		}
 		return ++retire_count == limit;
 	});
+	if (retire_count == 0 && !aggressive) {
+		m_gc_idle_until = scan_time + std::chrono::milliseconds(2);
+	}
 	if (dirty_buffers.empty()) {
 		return;
 	}
