@@ -608,6 +608,22 @@ using BindingType = TextureCache::BindingType;
 using ImageDesc = TextureCache::ImageDesc;
 using ShaderOpcode = ShaderRecompiler::Decoder::Opcode;
 
+ImageInfo MakeTilingImage(Prospero::BufferFormat format, uint32_t width,
+                          uint32_t height, uint32_t levels, uint32_t depth,
+                          Prospero::TileMode tile, uint64_t guest_size,
+                          bool volume) {
+  ImageInfo info{};
+  info.guest_format = format;
+  info.type =
+      volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
+  info.extent = {width, height, volume ? depth : 1u};
+  info.resources = {levels, volume ? 1u : depth};
+  info.data.size = guest_size;
+  info.tile_mode = tile;
+  info.UpdateSize();
+  return info;
+}
+
 constexpr u32 InlineU32(u32 value) { return 128u + value; }
 
 constexpr u32 Vgpr(u32 reg) { return 256u + reg; }
@@ -5508,7 +5524,7 @@ public:
     for (const auto mode : {0x41u, 0x61u}) {
       for (const auto &groups : empty_dispatches) {
         context.GetRenderExecutor().DispatchDirect(
-            0, scheduler.Current(), groups[0], groups[1], groups[2], mode);
+            0, scheduler.Current(), groups[0], groups[1], groups[2], mode, false);
       }
     }
     Require(name, "HTile fixture",
@@ -5798,23 +5814,10 @@ public:
               "wide/block image readback was not aligned to its texel block");
       resources.MapMemory(base, allocation_size);
 
-      ImageDesc sampled{};
-      sampled.type = BindingType::Texture;
-      sampled.info.data = {base, sizeof(initial)};
-      sampled.info.pixel_format = vk::Format::eR8G8B8A8Srgb;
-      sampled.info.guest_format = Prospero::BufferFormat::k8_8_8_8Srgb;
-      sampled.info.type = Prospero::ImageType::kColor2D;
-      sampled.info.extent = {1, 1, 1};
-      sampled.info.resources = {1, 1};
-      sampled.info.pitch = 1;
-      sampled.info.bytes_per_block = 4;
-      sampled.info.samples = 1;
-      sampled.info.tile_mode = Prospero::TileMode::kLinear;
-      sampled.info.mip_layout[0] = {0, 4, 1, 1};
-      sampled.view_info.format = sampled.info.pixel_format;
-      sampled.view_info.type = vk::ImageViewType::e2D;
-      sampled.view_info.aspect = vk::ImageAspectFlagBits::eColor;
-      sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      auto sampled =
+          MakeLinearDesc(base, sizeof(initial), vk::Format::eR8G8B8A8Srgb,
+                         Prospero::BufferFormat::k8_8_8_8Srgb,
+                         Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 
       auto &command = scheduler.Current();
       auto first_desc = sampled;
@@ -5989,8 +5992,9 @@ public:
       underspecified.info.extent = {2, 1, 1};
       underspecified.info.resources = {1, 1};
       underspecified.info.pitch = 2;
-      underspecified.info.mip_layout[0] = {0, 8, 2, 1};
-      underspecified.info.mip_layout[1] = {8, 4, 1, 1};
+      underspecified.info.mip_layout[0] = {0, 8, 2, 1, 0, 8, 2};
+      underspecified.info.mip_layout[1] = {8, 4, 1, 1, 8, 4, 1};
+      underspecified.info.linear_slice_stride = 0;
       underspecified.view_info.format = underspecified.info.pixel_format;
       underspecified.view_info.level_count = 1;
       const auto underspecified_id = texture_cache.FindImage(underspecified);
@@ -6076,7 +6080,7 @@ public:
       narrow_target.info.pitch = 128;
       narrow_target.info.bytes_per_block = 8;
       narrow_target.info.tile_mode = Prospero::TileMode::kRenderTarget;
-      narrow_target.info.mip_layout[0] = {0, 0x10000, 128, 1};
+      narrow_target.info.UpdateSize();
       narrow_target.view_info.format = narrow_target.info.pixel_format;
       narrow_target.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       const auto narrow_target_id = texture_cache.FindImage(narrow_target);
@@ -6085,6 +6089,7 @@ public:
 
       auto wide_target = narrow_target;
       wide_target.info.extent.width = 9;
+      wide_target.info.UpdateSize();
       const auto wide_target_id = texture_cache.FindImage(wide_target);
       const auto wide_target_view =
           texture_cache.FindRenderTarget(wide_target_id, wide_target);
@@ -6204,6 +6209,7 @@ public:
             }
           }
         }
+        desc.info.UpdateSize();
         const auto id = texture_cache.FindImage(desc);
         Require(name, "distinct mip-layout backing", id && id != previous,
                 "different guest mip layouts reused the same native image");
@@ -6247,6 +6253,7 @@ public:
           {256, 256, 1}, 1, 16, 1);
       raw_alias.type = BindingType::RenderTarget;
       raw_alias.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      raw_alias.info.UpdateSize();
       raw_alias.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       const auto raw_alias_id = texture_cache.FindImage(raw_alias);
       (void)texture_cache.FindRenderTarget(raw_alias_id, raw_alias);
@@ -6291,6 +6298,7 @@ public:
         bc5_expected.insert(bc5_expected.end(), bc5_guest.begin() + word,
                             bc5_guest.begin() + word + 4);
       }
+      bc5_alias.info.UpdateSize();
       const auto bc5_alias_id = texture_cache.FindImage(bc5_alias);
       Require(name, "BC5 alias owner separation",
               bc5_alias_id != raw_alias_id &&
@@ -6338,6 +6346,7 @@ public:
           tiled_array.info.mip_layout[level] = {
               mip.offset, mip.size * tiled_layers, mip.padded_width, mip.padded_height};
         }
+        tiled_array.info.UpdateSize();
         std::memset(memory + tiled_array_offset, 0, surface.total_size);
         const auto tiled_array_id = texture_cache.FindImage(tiled_array);
         (void)texture_cache.FindTexture(tiled_array_id, tiled_array);
@@ -6433,6 +6442,7 @@ public:
             mip_sizes[level].offset, mip_sizes[level].size,
             mip_padded[level].width, mip_padded[level].height};
       }
+      mip_desc.info.UpdateSize();
       const auto mip_image = texture_cache.FindImage(mip_desc);
       (void)texture_cache.FindTexture(mip_image, mip_desc);
       texture_cache.MarkGpuWritten(mip_image);
@@ -6513,7 +6523,7 @@ public:
                          vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
                          Prospero::ImageType::kColor2D, {1, 1, 1}, 2, 4, 1);
       array_desc.info.pitch = volume_pitch;
-      array_desc.info.mip_layout[0].pitch = volume_pitch;
+      array_desc.info.UpdateSize();
       const auto array_image = texture_cache.FindImage(array_desc);
       (void)texture_cache.FindTexture(array_image, array_desc);
       texture_cache.MarkGpuWritten(array_image);
@@ -6521,6 +6531,7 @@ public:
       volume_desc.info.type = Prospero::ImageType::kColor3D;
       volume_desc.info.extent = {1, 1, 2};
       volume_desc.info.resources.layers = 1;
+      volume_desc.info.UpdateSize();
       volume_desc.view_info.type = vk::ImageViewType::e3D;
       volume_desc.view_info.layer_count = 1;
       const auto volume_image = texture_cache.FindImage(volume_desc);
@@ -6585,9 +6596,11 @@ public:
           Prospero::ImageType::kColor2D, {2, 1, 1}, 1, sizeof(float), 1);
       depth_containment.type = BindingType::DepthTarget;
       depth_containment.info.resources.levels = 2;
-      depth_containment.info.mip_layout[0] = {0, 2 * sizeof(float), 2, 1};
-      depth_containment.info.mip_layout[1] = {2 * sizeof(float), sizeof(float),
-                                              1, 1};
+      depth_containment.info.mip_layout[0] = {
+          0, 2 * sizeof(float), 2, 1, 0, 2 * sizeof(float), 2};
+      depth_containment.info.mip_layout[1] = {
+          2 * sizeof(float), sizeof(float), 1, 1, 2 * sizeof(float), sizeof(float), 1};
+      depth_containment.info.linear_slice_stride = 0;
       depth_containment.view_info.format = vk::Format::eD32Sfloat;
       depth_containment.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       depth_containment.view_info.usage =
@@ -6772,6 +6785,7 @@ public:
           Prospero::ImageType::kColor2D, {128, 128, 1}, htile_layers, 4, 1);
       htile_depth.type = BindingType::DepthTarget;
       htile_depth.info.tile_mode = Prospero::TileMode::kDepth;
+      htile_depth.info.UpdateSize();
       htile_depth.info.metadata.kind = ImageMetadataKind::Htile;
       htile_depth.info.metadata.range = {base + 0x2a00000, htile_layers * 0x8000};
       htile_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
@@ -7113,7 +7127,7 @@ public:
           first_stencil_association &&
               first_stencil_association != ms_depth_image &&
               texture_cache.GetImage(first_stencil_association)
-                      .info.pixel_format == vk::Format::eUndefined &&
+                      .info.pixel_format == vk::Format::eS8Uint &&
               texture_cache.GetImage(first_stencil_association).backing.image ==
                   nullptr &&
               texture_cache.GetImage(first_stencil_association).depth_id ==
@@ -7410,8 +7424,9 @@ public:
           {13, 11, 1}, 2, 4, 1);
       stencil_clear_desc.info.stencil = {base + 0x27e2000, 0x1000};
       stencil_clear_desc.info.resources.levels = 2;
-      stencil_clear_desc.info.mip_layout[0] = {0, 0x800, 13, 11};
-      stencil_clear_desc.info.mip_layout[1] = {0x800, 0x800, 6, 5};
+      stencil_clear_desc.info.mip_layout[0] = {0, 0x800, 13, 11, 0, 0x400, 13};
+      stencil_clear_desc.info.mip_layout[1] = {0x800, 0x800, 6, 5, 0x800, 0x400, 6};
+      stencil_clear_desc.info.linear_slice_stride = 0x400;
       stencil_clear_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       const auto stencil_clear_id = texture_cache.FindImage(stencil_clear_desc);
@@ -7733,7 +7748,7 @@ public:
       dcc_array.type = BindingType::RenderTarget;
       dcc_array.info.tile_mode = Prospero::TileMode::kRenderTarget;
       dcc_array.info.pitch = TileGetRenderTargetPitch(128, 8);
-      dcc_array.info.mip_layout[0].pitch = dcc_array.info.pitch;
+      dcc_array.info.UpdateSize();
       dcc_array.info.metadata.kind = ImageMetadataKind::Dcc;
       dcc_array.info.metadata.range = {alias_dcc_address, 0x2000};
       dcc_array.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
@@ -7747,7 +7762,7 @@ public:
       auto dcc_alias = dcc_array;
       dcc_alias.info.data = {dcc_array.info.data.address + 0x10000, 0x10000};
       dcc_alias.info.resources.layers = 1;
-      dcc_alias.info.mip_layout[0].size = 0x10000;
+      dcc_alias.info.UpdateSize();
       dcc_alias.info.metadata.range = {alias_dcc_address + 0x1000, 0x1000};
       dcc_alias.view_info.type = vk::ImageViewType::e2D;
       dcc_alias.view_info.layer_count = 1;
@@ -7998,30 +8013,34 @@ public:
                                                  0.5f, 0.625f, 0.75f, 0.875f,
                                                  1.0f, 0.0625f};
       std::memset(memory + layered_offset, 0, layered_guest_size);
-      const auto layered_layout = TextureCalcUploadLayout(
+      const auto layered_layout = MakeTilingImage(
           Prospero::BufferFormat::k32Float, 2, 2, 2, 2,
-          Prospero::TileMode::kLinear, layered_guest_size, false,
-          "UnifiedTextureCacheFlow");
-      const auto layered_upload_regions =
-          TextureBuildImageCopies(layered_layout);
-      Require(name, "layered guest layout", layered_upload_regions.size() == 4,
-              "unexpected layered/mipped upload-region count");
+          Prospero::TileMode::kLinear, layered_guest_size, false);
+      const auto layered_upload_regions = layered_layout.BufferCopies();
+      Require(name, "layered guest layout", layered_upload_regions.size() == 2,
+              "linear array upload did not batch each mip");
       for (const auto &region : layered_upload_regions) {
-        for (uint32_t y = 0; y < region.imageExtent.height; y++) {
-          for (uint32_t x = 0; x < region.imageExtent.width; x++) {
-            const uint32_t logical =
-                region.imageSubresource.mipLevel == 0
-                    ? region.imageSubresource.baseArrayLayer * 4 + y * 2 + x
-                    : 8 + region.imageSubresource.baseArrayLayer;
-            const uint64_t byte_offset =
-                region.bufferOffset +
-                (static_cast<uint64_t>(y) * region.bufferRowLength + x) *
-                    sizeof(float);
-            Require(name, "layered guest layout bounds",
-                    byte_offset + sizeof(float) <= layered_guest_size,
-                    "layered guest texel lies outside its backing range");
-            std::memcpy(memory + layered_offset + byte_offset,
-                        &layered_values[logical], sizeof(float));
+        for (uint32_t layer = 0; layer < region.imageSubresource.layerCount;
+             ++layer) {
+          for (uint32_t y = 0; y < region.imageExtent.height; ++y) {
+            for (uint32_t x = 0; x < region.imageExtent.width; ++x) {
+              const uint32_t absolute_layer =
+                  region.imageSubresource.baseArrayLayer + layer;
+              const uint32_t logical = region.imageSubresource.mipLevel == 0
+                                           ? absolute_layer * 4 + y * 2 + x
+                                           : 8 + absolute_layer;
+              const uint64_t byte_offset =
+                  region.bufferOffset +
+                  ((uint64_t{layer} * region.bufferImageHeight + y) *
+                       region.bufferRowLength +
+                   x) *
+                      sizeof(float);
+              Require(name, "layered guest layout bounds",
+                      byte_offset + sizeof(float) <= layered_guest_size,
+                      "layered guest texel lies outside its backing range");
+              std::memcpy(memory + layered_offset + byte_offset,
+                          &layered_values[logical], sizeof(float));
+            }
           }
         }
       }
@@ -8033,6 +8052,7 @@ public:
       layered_color.info.mip_layout[0] = {0, 32, 2, 2};
       layered_color.info.mip_layout[1] = {32, 8, 1, 1};
       layered_color.view_info.level_count = 2;
+      layered_color.info.UpdateSize();
       const auto layered_color_image = texture_cache.FindImage(layered_color);
       (void)texture_cache.FindTexture(layered_color_image, layered_color);
       texture_cache.MarkGpuWritten(layered_color_image);
@@ -8048,17 +8068,19 @@ public:
       layered_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       layered_depth.view_info.usage =
           vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      layered_depth.info.UpdateSize();
       const auto layered_depth_image = texture_cache.FindImage(layered_depth);
       const auto &layered_native = texture_cache.GetImage(layered_depth_image);
-      Require(name, "layered mipped depth alias",
-              layered_depth_image != layered_color_image &&
-                  layered_native.backing.layers == 4 &&
-                  layered_native.backing.mip_levels == 1 &&
-                  layered_native.info.resources ==
-                      layered_depth.info.resources &&
-                  layered_native.info.mip_layout == layered_depth.info.mip_layout &&
-                  layered_native.IsGpuModified(),
-              "depth/color conversion mixed the source mip count with the requested layout");
+      Require(
+          name, "layered mipped depth alias",
+          layered_depth_image != layered_color_image &&
+              layered_native.backing.layers == 4 &&
+              layered_native.backing.mip_levels == 1 &&
+              layered_native.info.resources == layered_depth.info.resources &&
+              layered_native.info.mip_layout == layered_depth.info.mip_layout &&
+              layered_native.IsGpuModified(),
+          "depth/color conversion mixed the source mip count with the "
+          "requested layout");
       const volatile auto layered_guest_byte =
           *reinterpret_cast<const volatile uint8_t *>(memory + layered_offset);
       (void)layered_guest_byte;
@@ -9005,8 +9027,9 @@ public:
       for (uint32_t index = 0; index < linear_depth_words; index++) {
         linear_depth_guest[index] = 0x51000000u + index;
       }
-      constexpr std::array<uint8_t, 8> linear_stencil_guest{
-          0x91, 0x82, 0x73, 0x64, 0x55, 0x46, 0x37, 0x28};
+      constexpr std::array<uint8_t, 16> linear_stencil_guest{
+          0x91, 0x82, 0x73, 0x64, 0x55, 0x46, 0x37, 0x28,
+          0x19, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f, 0x80};
       std::memcpy(memory + linear_depth_offset, linear_depth_guest.data(),
                   sizeof(linear_depth_guest));
       std::memcpy(memory + linear_stencil_offset, linear_stencil_guest.data(),
@@ -9024,6 +9047,7 @@ public:
       linear_depth_desc.info.mip_layout[0] = {0, sizeof(linear_depth_guest),
                                               linear_depth_pitch,
                                               linear_depth_height};
+      linear_depth_desc.info.UpdateSize();
       linear_depth_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       linear_depth_desc.view_info.usage =
@@ -9125,6 +9149,7 @@ public:
       tiled_depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       tiled_depth_desc.view_info.usage =
           vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      tiled_depth_desc.info.UpdateSize();
       const auto tiled_depth_image = texture_cache.FindImage(tiled_depth_desc);
       Require(name, "tiled depth native clear",
               texture_cache.ClearImageFromBuffer(
@@ -9174,28 +9199,18 @@ public:
               TileGetBlockLayout(TileBlockFamily::Depth64KB, sizeof(uint32_t),
                                  depth_block),
               "failed to describe the tiled depth test surface");
-      std::array<GpuTileInfo, tiled_depth_layers> tiled_depth_tiles{};
-      for (uint32_t layer = 0; layer < tiled_depth_layers; layer++) {
-        const uint64_t offset = tiled_depth_slice * layer;
-        tiled_depth_tiles[layer] = {depth_block.family,
-                                    depth_block.bytes_per_element,
-                                    offset,
-                                    tiled_depth_slice,
-                                    offset,
-                                    tiled_depth_slice,
-                                    0,
-                                    tiled_depth_width,
-                                    tiled_depth_height,
-                                    1,
-                                    tiled_depth_pitch};
-        tiled_depth_tiles[layer].surface_z = layer;
-      }
+      auto tiled_depth_info =
+          MakeTilingImage(Prospero::BufferFormat::k32Float, tiled_depth_width,
+                          tiled_depth_height, 1, tiled_depth_layers,
+                          Prospero::TileMode::kDepth, tiled_depth_size, false);
+      tiled_depth_info.linear_slice_stride = tiled_depth_slice;
+      tiled_depth_info.mip_layout[0].linear_size = tiled_depth_slice;
+      tiled_depth_info.mip_layout[0].linear_pitch = tiled_depth_pitch;
       auto tiled_depth_input =
           CreateHostBuffer(name, tiled_depth_size, AllFlags, tiled_depth_after);
       auto tiled_depth_linear =
           TextureCacheTestAccess::Tiler(texture_cache)
-              .Detile(tiled_depth_input.buffer, 0, tiled_depth_size,
-                      tiled_depth_size, tiled_depth_tiles);
+              .Detile(tiled_depth_input.buffer, 0, tiled_depth_info);
       auto tiled_depth_output =
           CreateHostBuffer(name, tiled_depth_size, AllFlags,
                            std::vector<uint32_t>(tiled_depth_guest.size(), 0));
@@ -9259,6 +9274,7 @@ public:
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       tiled_d16_desc.view_info.usage =
           vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      tiled_d16_desc.info.UpdateSize();
       const auto tiled_d16_image = texture_cache.FindImage(tiled_d16_desc);
       Require(name, "tiled D16 native clear",
               texture_cache.ClearImageFromBuffer(
@@ -9291,32 +9307,22 @@ public:
                                             sizeof(uint32_t));
       std::memcpy(tiled_d16_words.data(), tiled_d16_after.data(),
                   tiled_depth_size);
-      std::array<GpuTileInfo, tiled_depth_layers> tiled_d16_tiles{};
       Require(name, "tiled D16 block layout",
               TileGetBlockLayout(TileBlockFamily::Depth64KB, sizeof(uint16_t),
                                  depth_block),
               "failed to describe the tiled D16 test surface");
-      for (uint32_t layer = 0; layer < tiled_depth_layers; layer++) {
-        const uint64_t offset = tiled_depth_slice * layer;
-        tiled_d16_tiles[layer] = {depth_block.family,
-                                  depth_block.bytes_per_element,
-                                  offset,
-                                  tiled_depth_slice,
-                                  offset,
-                                  tiled_depth_slice,
-                                  0,
-                                  tiled_depth_width,
-                                  tiled_depth_height,
-                                  1,
-                                  tiled_depth_pitch};
-        tiled_d16_tiles[layer].surface_z = layer;
-      }
+      auto tiled_d16_info =
+          MakeTilingImage(Prospero::BufferFormat::k16UNorm, tiled_depth_width,
+                          tiled_depth_height, 1, tiled_depth_layers,
+                          Prospero::TileMode::kDepth, tiled_depth_size, false);
+      tiled_d16_info.linear_slice_stride = tiled_depth_slice;
+      tiled_d16_info.mip_layout[0].linear_size = tiled_depth_slice;
+      tiled_d16_info.mip_layout[0].linear_pitch = tiled_depth_pitch;
       auto tiled_d16_input =
           CreateHostBuffer(name, tiled_depth_size, AllFlags, tiled_d16_words);
       auto tiled_d16_linear =
           TextureCacheTestAccess::Tiler(texture_cache)
-              .Detile(tiled_d16_input.buffer, 0, tiled_depth_size,
-                      tiled_depth_size, tiled_d16_tiles);
+              .Detile(tiled_d16_input.buffer, 0, tiled_d16_info);
       auto tiled_d16_output =
           CreateHostBuffer(name, tiled_depth_size, AllFlags,
                            std::vector<uint32_t>(tiled_d16_words.size(), 0));
@@ -9575,6 +9581,7 @@ public:
           {tile_alias_extent, tile_alias_extent, 1}, 1, 4, 1);
       render_target_alias.type = BindingType::Storage;
       render_target_alias.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      render_target_alias.info.UpdateSize();
       render_target_alias.view_info.usage = vk::ImageUsageFlagBits::eStorage;
       const auto render_target_alias_image =
           texture_cache.FindImage(render_target_alias);
@@ -9582,6 +9589,7 @@ public:
       auto standard_4kb_alias = render_target_alias;
       standard_4kb_alias.type = BindingType::Texture;
       standard_4kb_alias.info.tile_mode = Prospero::TileMode::kStandard4KB;
+      standard_4kb_alias.info.UpdateSize();
       standard_4kb_alias.view_info.usage = vk::ImageUsageFlagBits::eSampled;
       const auto standard_4kb_alias_image =
           texture_cache.FindImage(standard_4kb_alias);
@@ -9735,7 +9743,7 @@ public:
       desc.info.samples = 1;
       desc.info.tile_mode = tile;
       desc.info.bgra16 = true;
-      desc.info.mip_layout[0] = {mip.offset, mip.size, pitch, 1};
+      desc.info.UpdateSize();
       desc.view_info.format = desc.info.pixel_format;
       desc.view_info.type = vk::ImageViewType::e2D;
       desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
@@ -9937,7 +9945,10 @@ public:
 
       if (width == 1 && height == 1) {
         Require(name, "single-texel tiled layout",
-                color.desc.info.mip_layout[0] == ImageMipInfo{0, 0x10000, 128, 64},
+                color.desc.info.mip_layout[0].offset == 0 &&
+                    color.desc.info.mip_layout[0].size == 0x10000 &&
+                    color.desc.info.mip_layout[0].pitch == 128 &&
+                    color.desc.info.mip_layout[0].height == 64,
                 "the render target lost the expected padded block height");
       }
 
@@ -10434,6 +10445,7 @@ public:
       auto expanded = storage_desc;
       expanded.info.extent.depth = 56;
       expanded.info.data.size = allocation_size;
+      expanded.info.UpdateSize();
       const auto expanded_id = texture_cache.FindImage(expanded);
       Require(name, "3D storage depth expansion",
               expanded_id != color.image_id &&
@@ -10569,9 +10581,24 @@ public:
     desc.info.samples = samples;
     desc.info.tile_mode = Prospero::TileMode::kLinear;
     desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
+    desc.info.tiling.texel_width = desc.info.IsBlock() ? 4u : 1u;
+    desc.info.tiling.texel_height = desc.info.IsBlock() ? 4u : 1u;
+    desc.info.tiling.block.bytes_per_element = bytes_per_block;
+    desc.info.linear_slice_stride =
+        size / (type == Prospero::ImageType::kColor3D ? extent.depth : layers);
+    desc.info.mip_layout[0].pitch =
+        (extent.width + desc.info.tiling.texel_width - 1u) /
+        desc.info.tiling.texel_width;
+    desc.info.mip_layout[0].height =
+        (extent.height + desc.info.tiling.texel_height - 1u) /
+        desc.info.tiling.texel_height;
+    desc.info.mip_layout[0].linear_pitch = desc.info.mip_layout[0].pitch;
+    desc.info.mip_layout[0].linear_size = desc.info.linear_slice_stride;
     desc.view_info.format = format;
-    desc.view_info.type = type == Prospero::ImageType::kColor3D ? vk::ImageViewType::e3D
-        : layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
+    desc.view_info.type = type == Prospero::ImageType::kColor3D
+                              ? vk::ImageViewType::e3D
+                          : layers > 1 ? vk::ImageViewType::e2DArray
+                                       : vk::ImageViewType::e2D;
     desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
     desc.view_info.layer_count = layers;
     desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
@@ -10615,6 +10642,113 @@ public:
     auto result = ReadBuffer(name, probe, bytes / 4);
     DestroyBuffer(&probe);
     return result;
+  }
+
+  void CheckScalarLeafCall() {
+    constexpr const char* name = "ScalarLeafCall";
+    constexpr uintptr_t base = 0x0000000204800000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto table = base + 0x100;
+    constexpr auto first = base + 0x1000;
+    constexpr auto second = base + 0x2000;
+    constexpr auto output = base + 0x4000;
+    std::vector<u32> code{
+        EncodeSMovB32(20, InlineU32(0)),
+        0xbeea03ffu, static_cast<u32>(base), 0xbeeb03ffu, static_cast<u32>(base >> 32u),
+        0xf4080135u, 0xfa000000u, 0xbf8cc07fu, 0xf4240382u, 0xfa000020u,
+        0xbf8cc07fu, 0xbf130e80u, 0xbf840004u, 0xf4240402u, 0xfa000028u,
+        0xbf8cc07fu, 0xbe8e210eu, EncodeVop1(0x01, 1, 20),
+        EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "call fixture allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void*>(base),
+        "call fixture mapping failed");
+    std::memset(mapped, 0, size);
+    const ShaderBufferResource table_desc{{static_cast<u32>(table),
+        static_cast<u32>(table >> 32u) | (16u << 16u), 8, 0x5204u}};
+    LibKernel::Memory::WriteBacking(base, table_desc.fields, sizeof(table_desc.fields));
+    const std::array leaf{EncodeSMovB32(20, 255), 41u, EncodeSop1(0x21, 125, 14)};
+    for (const auto address : {first, second})
+      LibKernel::Memory::WriteBacking(address, leaf.data(), sizeof(leaf));
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto& cache = context.GetBufferCache();
+      auto& shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4});
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 4;
+      out.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(i, out.fields[i], HW::UserSgprType::Unknown);
+      uint64_t original_id = 0;
+      struct Case { uint64_t address; u32 value; bool update; u32 field = 0; };
+      for (const auto test : {Case{first, 41, false}, Case{first, 41, false},
+                              Case{second, 41, false}, Case{second, 73, true},
+                              Case{first, 41, false}, Case{first, 6, false, 0x1818},
+                              Case{first, 0, false, 0x0a18}}) {
+        Require(name, "refresh function pointer", context.InvalidateMemory(table + 0x20, 8),
+                "function table escaped mapped memory");
+        const uint64_t target = test.address | 3u;
+        LibKernel::Memory::WriteBacking(table + 0x20, &target, sizeof(target));
+        if (test.field != 0) {
+          Require(name, "refresh hardware-field leaf", context.InvalidateMemory(first, sizeof(leaf)),
+                  "hardware-field leaf escaped mapped memory");
+          const std::array field_leaf{0xb96a0000u | test.field,
+              EncodeSMovB32(20, 106), EncodeSop1(0x21, 125, 14)};
+          LibKernel::Memory::WriteBacking(first, field_leaf.data(), sizeof(field_leaf));
+        }
+        if (test.update) {
+          auto [buffer, offset] = cache.ObtainBuffer(test.address + 4, 4, true);
+          buffer->Fill(offset, 4, test.value);
+          Require(name, "GPU-written function code", cache.HasGpuDirtyBytes(test.address + 4, 4),
+                  "code mutation did not remain GPU-owned before refresh");
+        }
+        ShaderComputeInputInfo input{};
+        const auto program = context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+        if (original_id == 0) original_id = program.id;
+        Require(name, "exact function identity",
+                (program.id == original_id) == (test.value == 41),
+                "helper bytes were stale or identical relocated/restored code recompiled");
+        Require(name, "current code dependency",
+                std::ranges::find(input.stage.resources->specialization_reads,
+                    std::pair<uint64_t, uint64_t>{test.address, sizeof(leaf)}) !=
+                    input.stage.resources->specialization_reads.end(),
+                "function relocation retained an old code dependency");
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        cache.ReadMemory(output, sizeof(u32));
+        u32 actual = 0;
+        Require(name, "scalar leaf execution and return",
+                LibKernel::Memory::TryReadBacking(output, &actual, sizeof(actual)) && actual == test.value,
+                "caller did not observe the leaf's scalar result after return");
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "call fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckNativeIndirectDispatch() {
@@ -11281,7 +11415,7 @@ public:
           for (uint32_t i = 0; i < user_data.size(); i++) {
             shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
           }
-          executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u);
+          executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u, false);
         };
         const auto metadata_words = static_cast<uint32_t>(metadata_size / 4);
         fill_metadata(metadata_words);
@@ -11507,7 +11641,7 @@ public:
         metadata_alias.info.extent = {4096, 1, 1};
         metadata_alias.info.pitch = 4096;
         metadata_alias.info.bytes_per_block = sizeof(uint32_t);
-        metadata_alias.info.mip_layout[0] = {0, 0x4000, 4096, 1};
+        metadata_alias.info.UpdateSize();
         metadata_alias.view_info.format = vk::Format::eR32Uint;
         const auto metadata_alias_id = texture_cache.FindImage(metadata_alias);
         vk::ClearValue alias_paint{};
@@ -11565,7 +11699,7 @@ public:
         previous_depth.info.bytes_per_block = 4;
         previous_depth.info.samples = 1;
         previous_depth.info.tile_mode = Prospero::TileMode::kLinear;
-        previous_depth.info.mip_layout[0] = {0, 0x10000, 128, 128};
+        previous_depth.info.UpdateSize();
         previous_depth.info.metadata.kind = ImageMetadataKind::Htile;
         previous_depth.info.metadata.range = {dcc_address, metadata_size};
         previous_depth.info.htile_clear_mask = 0;
@@ -11751,13 +11885,17 @@ public:
                 target.export_mapping == Prospero::ColorMappingAbgr,
             "shared format resolution changed the existing 1555 render target");
     for (const auto native : {target, TextureGetRenderTargetFormat(
-             Prospero::ChannelLayout::k8, Prospero::ChannelType::kSNorm,
-             Prospero::ChannelOrder::kStandard)}) {
-      const auto upload = TextureCalcUploadLayout(native.guest_format, 4, 1, 1, 1,
-          Prospero::TileMode::kLinear, 256, false, name);
-      Require(name, "render-target guest upload layout",
-              upload.pitch * native.bytes_per_element == 256 && upload.mips[0].size == 256,
-              "retaining the render-target format lost its physical byte width");
+                                          Prospero::ChannelLayout::k8,
+                                          Prospero::ChannelType::kSNorm,
+                                          Prospero::ChannelOrder::kStandard)}) {
+      const auto upload =
+          MakeTilingImage(native.guest_format, 4, 1, 1, 1,
+                          Prospero::TileMode::kLinear, 256, false);
+      Require(
+          name, "render-target guest upload layout",
+          upload.pitch * native.bytes_per_element == 256 &&
+              upload.mip_layout[0].linear_size == 256,
+          "retaining the render-target format lost its physical byte width");
     }
     EnsureRuntimeContext();
     int64_t direct_offset = -1;
@@ -12880,7 +13018,7 @@ public:
           auto depth_desc = MakeLinearDesc(alias_address, 256, vk::Format::eD16Unorm,
               format, Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 2, 1);
           depth_desc.info.pitch = 128;
-          depth_desc.info.mip_layout[0] = {0, 256, 128, 1};
+          depth_desc.info.UpdateSize();
           depth_desc.type = BindingType::DepthTarget;
           depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
           depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
@@ -12960,7 +13098,7 @@ public:
             Prospero::BufferFormat::k8UNorm, Prospero::ImageType::kColor2D,
             {1, 1, 1}, 6, 1, 1);
         array_desc.info.pitch = 256;
-        array_desc.info.mip_layout[0] = {0, 1536, 256, 1};
+        array_desc.info.UpdateSize();
         auto volume_desc = array_desc;
         volume_desc.info.type = Prospero::ImageType::kColor3D;
         volume_desc.info.data.size = 256;
@@ -13096,7 +13234,10 @@ public:
         desc.info.bytes_per_block = 4;
         desc.info.samples = 1;
         desc.info.tile_mode = linear;
-        desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
+        desc.info.mip_layout[0] = {
+            0, size, extent.width, extent.height, 0, size, extent.width};
+        desc.info.tiling.block.bytes_per_element = 4;
+        desc.info.linear_slice_stride = size;
         desc.view_info.format = desc.info.pixel_format;
         desc.view_info.type = vk::ImageViewType::e2D;
         desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
@@ -13813,8 +13954,9 @@ public:
       split_desc.info.bytes_per_block = 4;
       split_desc.info.samples = 1;
       split_desc.info.tile_mode = linear;
-      split_desc.info.mip_layout[0] = {0, 8, 2, 1};
-      split_desc.info.mip_layout[1] = {8, 4, 1, 1};
+      split_desc.info.mip_layout[0] = {0, 8, 2, 1, 0, 8, 2};
+      split_desc.info.mip_layout[1] = {8, 4, 1, 1, 8, 4, 1};
+      split_desc.info.tiling.block.bytes_per_element = 4;
       split_desc.view_info.format = split_desc.info.pixel_format;
       split_desc.view_info.type = vk::ImageViewType::e2D;
       split_desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
@@ -14754,9 +14896,10 @@ public:
       video_parent.info.pixel_format = vk::Format::eR8G8B8A8Srgb;
       video_parent.info.guest_format = Prospero::BufferFormat::k8_8_8_8Srgb;
       video_parent.info.resources.levels = 2;
-      video_parent.info.mip_layout[0] = {0, target_mip_size, 2, 2};
-      video_parent.info.mip_layout[1] = {target_mip_size, target_mip_size, 1,
-                                         1};
+      video_parent.info.mip_layout[0] = {0, target_mip_size, 2, 2,
+                                         0, target_mip_size, 2};
+      video_parent.info.mip_layout[1] = {target_mip_size, target_mip_size, 1, 1,
+                                         target_mip_size, target_mip_size, 1};
       video_parent.view_info.format = video_parent.info.pixel_format;
       video_parent.view_info.usage = vk::ImageUsageFlagBits::eSampled;
       const auto video_parent_id = texture_cache.FindImage(video_parent);
@@ -15130,7 +15273,7 @@ public:
       depth.info.bytes_per_block = 4;
       depth.info.samples = 1;
       depth.info.tile_mode = linear;
-      depth.info.mip_layout[0] = {0, depth.info.data.size, 1, 1};
+      depth.info.UpdateSize();
       depth.view_info.format = depth.info.pixel_format;
       depth.view_info.type = vk::ImageViewType::e2D;
       depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
@@ -15156,18 +15299,17 @@ public:
       target_parent.info.resources.levels = 2;
       // PS5 linear rows align to 256 bytes; smaller mips precede larger ones.
       target_parent.info.pitch = 64;
-      target_parent.info.mip_layout[0] = {512, 1024, 64, 4};
-      target_parent.info.mip_layout[1] = {0, 512, 64, 2};
+      target_parent.info.UpdateSize();
       target_parent.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       auto target_base_subresource =
           make_target_desc(base + 512, 1024, {4, 4, 1});
       target_base_subresource.info.pitch = 64;
-      target_base_subresource.info.mip_layout[0] = {0, 1024, 64, 4};
+      target_base_subresource.info.UpdateSize();
       const auto target_base_subresource_id =
           texture_cache.FindImage(target_base_subresource);
       auto target_subresource = make_target_desc(base, 512, {2, 2, 1});
       target_subresource.info.pitch = 64;
-      target_subresource.info.mip_layout[0] = {0, 512, 64, 2};
+      target_subresource.info.UpdateSize();
       const auto target_subresource_id =
           texture_cache.FindImage(target_subresource);
       const auto *target_subresource_owner =
@@ -15364,13 +15506,13 @@ public:
       const auto sampled_stencil_id = prepared.images[0].image_id;
       Require(name, "first stencil discovery",
               prepared.images.size() == 1 &&
-                  sampled_stencil_id != depth_id &&
+                  sampled_stencil_id == depth_id &&
                   prepared.images[0].image_view == nullptr &&
                   texture_cache.GetImage(sampled_stencil_id).binding.is_bound &&
                   !texture_cache.GetImage(stencil_proxy_id).binding.is_bound &&
                   !texture_cache.GetImage(stencil_proxy_id).binding.is_target,
-              "the first sampled-stencil lookup did not remain an ordinary "
-              "discovery before final depth acquisition");
+              "the first sampled-stencil lookup did not use the canonical "
+              "depth owner without acquiring the stencil proxy");
 
       context.GetRenderExecutor().RebindImages(prepared);
       Require(name, "first stencil acquisition",
@@ -15386,7 +15528,7 @@ public:
           executor, scheduler.Current(), &no_reassociated_color, 0,
           reassociated_depth);
       Require(name, "existing stencil association selection",
-              texture_cache.GetImage(sampled_stencil_id).depth_id ==
+              texture_cache.GetImage(stencil_proxy_id).depth_id ==
                   reassociated_depth.image_id,
               "final depth acquisition did not associate the existing image "
               "at the stencil guest address");
@@ -15399,7 +15541,7 @@ public:
                   redirected.images[0].image_id == depth_id &&
                   redirected.images[0].image_view == nullptr &&
                   texture_cache.GetImage(depth_id).binding.is_bound &&
-                  !texture_cache.GetImage(sampled_stencil_id).binding.is_bound,
+                  !texture_cache.GetImage(stencil_proxy_id).binding.is_bound,
               "the established stencil association did not redirect the next "
               "discovery to the depth owner");
       context.GetRenderExecutor().RebindImages(redirected);
@@ -15520,7 +15662,7 @@ public:
         plane_depth.info.extent = {3, 2, 1};
         plane_depth.info.pitch = TileGetDepthPitch(3, sizeof(uint32_t));
         plane_depth.info.tile_mode = Prospero::TileMode::kDepth;
-        plane_depth.info.mip_layout[0] = {0, plane_size, plane_depth.info.pitch, 2};
+        plane_depth.info.UpdateSize();
         const auto plane_depth_id = texture_cache.FindImage(plane_depth);
         auto sampled_plane = plane_depth;
         sampled_plane.type = BindingType::Texture;
@@ -15531,7 +15673,7 @@ public:
         sampled_plane.info.guest_format = Prospero::BufferFormat::k8UInt;
         sampled_plane.info.bytes_per_block = 1;
         sampled_plane.info.pitch = TileGetDepthPitch(3, 1);
-        sampled_plane.info.mip_layout[0] = {0, plane_size, sampled_plane.info.pitch, 2};
+        sampled_plane.info.UpdateSize();
         sampled_plane.view_info.format = vk::Format::eR8Uint;
         sampled_plane.view_info.aspect = vk::ImageAspectFlagBits::eColor;
         sampled_plane.view_info.usage = vk::ImageUsageFlagBits::eSampled;
@@ -16004,7 +16146,8 @@ public:
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
                 vk::Sampler sampler = nullptr,
-                std::span<const Image> sampled_resources = {}) {
+                std::span<const Image> sampled_resources = {},
+                std::span<const vk::Sampler> sampler_resources = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto shader_data = compiled.packed_user_data;
@@ -16319,11 +16462,12 @@ public:
       writes.push_back(write);
     }
     if (Count(Kind::Samplers) != 0) {
-      Require(test.name, "dispatch", sampler != nullptr,
-              "sampler descriptor requested but no sampler was provided");
+      Require(test.name, "dispatch", sampler_resources.empty()
+                  ? sampler != nullptr : sampler_resources.size() == Count(Kind::Samplers),
+              "sampler resources must match the native sampler array");
       sampler_infos.resize(Count(Kind::Samplers));
-      for (auto &info : sampler_infos) {
-        info.sampler = sampler;
+      for (u32 index = 0; index < sampler_infos.size(); ++index) {
+        sampler_infos[index].sampler = sampler_resources.empty() ? sampler : sampler_resources[index];
       }
       vk::WriteDescriptorSet write{};
       write.dstSet = descriptor_set;
@@ -16530,7 +16674,7 @@ public:
       depth.desc.info.pitch = 64;
       depth.desc.info.bytes_per_block = 4;
       depth.desc.info.tile_mode = Prospero::TileMode::kLinear;
-      depth.desc.info.mip_layout[0] = {0, 256 * extent, 64, extent};
+      depth.desc.info.UpdateSize();
       depth.desc.view_info.format = depth.desc.info.pixel_format;
       depth.desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       depth.desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
@@ -16608,7 +16752,10 @@ public:
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
     color.desc.info.data = {depth_address + 0x10000, extent * extent * 16};
-    color.desc.info.mip_layout[0] = {0, color.desc.info.data.size, extent, extent};
+    color.desc.info.mip_layout[0] = {
+        0, color.desc.info.data.size, extent, extent, 0, color.desc.info.data.size, extent};
+    color.desc.info.tiling.block.bytes_per_element = 16;
+    color.desc.info.linear_slice_stride = color.desc.info.data.size;
     color.desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
     color.desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
     color.desc.info.extent = {extent, extent, 1};
@@ -17822,18 +17969,23 @@ public:
     const auto gpu_detile =
         [&](const std::vector<uint8_t> &tiled, std::vector<uint8_t> *linear,
             uint64_t tiled_capacity, uint64_t linear_capacity,
-            std::span<const GpuTileInfo> infos) {
+            const ImageInfo &info, TileManager *manager = nullptr,
+            uint64_t source_offset = 0) {
           const uint64_t padded_tiled = align_dword(tiled_capacity);
           const uint64_t padded_linear = align_dword(linear_capacity);
-          auto input = CreateHostBuffer(name, padded_tiled, AllFlags,
-                                        to_dwords(tiled, padded_tiled));
+          std::vector<uint8_t> source(source_offset + padded_tiled, 0x7b);
+          std::copy(tiled.begin(), tiled.end(), source.begin() + source_offset);
+          auto input = CreateHostBuffer(name, source.size(), AllFlags,
+                                        to_dwords(source, source.size()));
           auto output = CreateHostBuffer(
               name, padded_linear, AllFlags,
               std::vector<u32>(static_cast<size_t>(padded_linear / sizeof(u32)),
-                               0xabababab));
-          const auto result = tile_manager.Detile(input.buffer, 0, padded_tiled,
-                                                  padded_linear, infos);
-          const vk::BufferCopy copy{result.offset, 0, padded_linear};
+                               0));
+          const auto result = (manager ? *manager : tile_manager)
+                                  .Detile(input.buffer, source_offset, info);
+          Require(name, "detile capacity", result.size <= padded_linear,
+                  "canonical transfer size exceeded the fixture output");
+          const vk::BufferCopy copy{result.offset, 0, align_dword(result.size)};
           scheduler.Current().Handle().copyBuffer(result.buffer, output.buffer,
                                                   1, &copy);
           host_barrier(output.buffer, padded_linear,
@@ -17847,22 +17999,34 @@ public:
     const auto gpu_tile = [&](const std::vector<uint8_t> &linear,
                               std::vector<uint8_t> *tiled,
                               uint64_t tiled_capacity, uint64_t linear_capacity,
-                              std::span<const GpuTileInfo> infos) {
+                              const ImageInfo &info,
+                              TileManager *manager = nullptr,
+                              uint32_t levels = 0, uint64_t source_offset = 0,
+                              uint64_t target_offset = 0) {
       const uint64_t padded_tiled = align_dword(tiled_capacity);
       const uint64_t padded_linear = align_dword(linear_capacity);
-      auto input = CreateHostBuffer(name, padded_linear, AllFlags,
-                                    to_dwords(linear, padded_linear));
+      std::vector<uint8_t> source(source_offset + padded_linear, 0x7b);
+      std::copy(linear.begin(), linear.end(), source.begin() + source_offset);
+      auto input = CreateHostBuffer(name, source.size(), AllFlags,
+                                    to_dwords(source, source.size()));
       auto output = CreateHostBuffer(
-          name, padded_tiled, AllFlags,
-          std::vector<u32>(static_cast<size_t>(padded_tiled / sizeof(u32)),
-                           0xabababab));
-      tile_manager.Tile(input.buffer, 0, padded_linear, output.buffer, 0,
-                        padded_tiled, infos);
-      host_barrier(output.buffer, padded_tiled,
+          name, target_offset + padded_tiled, AllFlags,
+          std::vector<u32>(
+              static_cast<size_t>((target_offset + padded_tiled) / sizeof(u32)),
+              0xabababab));
+      (manager ? *manager : tile_manager)
+          .Tile(input.buffer, source_offset, padded_linear, output.buffer,
+                target_offset, padded_tiled, info, levels);
+      host_barrier(output.buffer, target_offset + padded_tiled,
                    vk::PipelineStageFlagBits::eComputeShader,
                    vk::AccessFlagBits::eShaderWrite);
       scheduler.Finish();
-      *tiled = read_bytes(output, tiled_capacity);
+      const auto observed = read_bytes(output, target_offset + tiled_capacity);
+      Require(name, "nonzero transfer target base",
+              std::all_of(observed.begin(), observed.begin() + target_offset,
+                          [](uint8_t value) { return value == 0xab; }),
+              "tiling changed bytes preceding its target offset");
+      tiled->assign(observed.begin() + target_offset, observed.end());
       DestroyBuffer(&output);
       DestroyBuffer(&input);
     };
@@ -17983,58 +18147,104 @@ public:
     };
     auto convert_reference = [&](bool to_tiled, std::vector<uint8_t> *dst,
                                  const std::vector<uint8_t> &src,
-                                 const GpuTileInfo &info) {
-      TileBlockLayout block{};
-      Require(name, "reference layout",
-              TileGetBlockLayout(info.family, info.bytes_per_element, block),
-              "CPU reference rejected GPU tile info");
-      const u32 tiled_width =
-          info.tiled_width != 0 ? info.tiled_width : info.pitch;
-      const u32 tiled_height =
-          info.tiled_height != 0 ? info.tiled_height : info.height;
+                                 const ImageInfo &info, uint32_t level = 0) {
+      const auto &block = info.tiling.block;
+      const auto &mip = info.mip_layout[level];
+      const auto active = info.MipExtent(level);
+      const uint32_t width = (active.width + info.tiling.texel_width - 1u) /
+                             info.tiling.texel_width;
+      const uint32_t height = (active.height + info.tiling.texel_height - 1u) /
+                              info.tiling.texel_height;
       const uint64_t columns =
-          (tiled_width + block.block_width - 1u) / block.block_width;
-      const uint64_t rows =
-          (tiled_height + block.block_height - 1u) / block.block_height;
+          (mip.pitch + block.block_width - 1u) / block.block_width;
       const uint64_t slice = info.linear_slice_stride != 0
                                  ? info.linear_slice_stride
-                                 : static_cast<uint64_t>(info.pitch) *
-                                       info.height * info.bytes_per_element;
-      for (u32 z = 0; z < info.depth; ++z) {
-        for (u32 y = 0; y < info.height; ++y) {
-          for (u32 x = 0; x < info.width; ++x) {
-            const u32 bx = info.tail ? 0 : x / block.block_width;
-            const u32 by = info.tail ? 0 : y / block.block_height;
-            const u32 bz = info.tail ? 0 : z / block.block_depth;
-            const u32 lx = info.tail ? x + info.tail_x : x % block.block_width;
-            const u32 ly = info.tail ? y + info.tail_y : y % block.block_height;
+                                 : mip.linear_size;
+      const bool tail = level >= info.first_tail_level;
+      for (u32 z = 0; z < active.depth; ++z) {
+        for (u32 y = 0; y < height; ++y) {
+          for (u32 x = 0; x < width; ++x) {
+            const u32 bx = tail ? 0 : x / block.block_width;
+            const u32 by = tail ? 0 : y / block.block_height;
+            const u32 bz = z / block.block_depth;
+            const u32 lx = tail ? x + mip.tail_x : x % block.block_width;
+            const u32 ly = tail ? y + mip.tail_y : y % block.block_height;
             const u32 lz = z % block.block_depth;
             u32 local = 0, block_xor = 0;
             Require(name, "reference offset",
                     TileGetBlockOffset(block, lx, ly, lz, local) &&
-                        TileGetBlockXor(block, bx, by, info.surface_z + bz,
+                        TileGetBlockXor(block, bx, by, mip.surface_z + bz,
                                         block_xor),
                     "CPU reference address lookup failed");
-            const uint64_t block_index =
-                static_cast<uint64_t>(bz) * columns * rows + by * columns + bx;
-            const uint64_t tiled = info.tiled_offset +
-                                   block_index * block.block_size +
-                                   (local ^ block_xor);
+            const uint64_t tiled =
+                mip.offset + uint64_t{bz} * info.tiled_slice_stride +
+                (by * columns + bx) * block.block_size + (local ^ block_xor);
             const uint64_t linear =
-                info.linear_offset + static_cast<uint64_t>(z) * slice +
-                static_cast<uint64_t>(y) * info.pitch * info.bytes_per_element +
-                static_cast<uint64_t>(x) * info.bytes_per_element;
+                mip.linear_offset + uint64_t{z} * slice +
+                (uint64_t{y} * mip.linear_pitch + x) * block.bytes_per_element;
             const uint64_t dst_offset = to_tiled ? tiled : linear;
             const uint64_t src_offset = to_tiled ? linear : tiled;
             Require(name, "reference range",
-                    dst_offset + info.bytes_per_element <= dst->size() &&
-                        src_offset + info.bytes_per_element <= src.size(),
+                    dst_offset + block.bytes_per_element <= dst->size() &&
+                        src_offset + block.bytes_per_element <= src.size(),
                     "CPU reference address escaped storage");
-            std::memcpy(dst->data() + dst_offset, src.data() + src_offset,
-                        info.bytes_per_element);
+            if (info.GetColorTransform() == ColorTransform::Reverse10_11_11) {
+              uint32_t packed = 0;
+              std::memcpy(&packed, src.data() + src_offset, sizeof(packed));
+              const std::array<uint32_t, 3> widths =
+                  to_tiled ? std::array<uint32_t, 3>{11, 11, 10}
+                           : std::array<uint32_t, 3>{10, 11, 11};
+              std::array<uint32_t, 3> channels{};
+              for (uint32_t channel = 0; channel < channels.size(); ++channel) {
+                channels[channel] = packed & ((1u << widths[channel]) - 1u);
+                packed >>= widths[channel];
+              }
+              uint32_t shift = 0;
+              for (int channel = 2; channel >= 0; --channel) {
+                packed |= channels[channel] << shift;
+                shift += widths[channel];
+              }
+              std::memcpy(dst->data() + dst_offset, &packed, sizeof(packed));
+            } else if (info.GetColorTransform() == ColorTransform::SwapBgra16) {
+              std::array<uint16_t, 4> channels{};
+              std::memcpy(channels.data(), src.data() + src_offset,
+                          sizeof(channels));
+              std::swap(channels[0], channels[2]);
+              std::memcpy(dst->data() + dst_offset, channels.data(),
+                          sizeof(channels));
+            } else {
+              std::memcpy(dst->data() + dst_offset, src.data() + src_offset,
+                          block.bytes_per_element);
+            }
           }
         }
       }
+    };
+    const auto block_image = [](const TileBlockLayout &block, u32 width,
+                                u32 height, u32 depth, u32 pitch,
+                                uint64_t guest_size) {
+      ImageInfo info{};
+      info.extent = {width, height, block.block_depth > 1 ? depth : 1u};
+      info.type = block.block_depth > 1 ? Prospero::ImageType::kColor3D
+                                        : Prospero::ImageType::kColor2D;
+      info.resources = {1, block.block_depth > 1 ? 1u : depth};
+      info.tile_mode = Prospero::TileMode::kStandard4KB;
+      info.bytes_per_block = block.bytes_per_element;
+      info.tiling = {block, 1, 1};
+      info.data.size = guest_size;
+      info.first_tail_level = 16;
+      const uint64_t columns =
+          (pitch + block.block_width - 1u) / block.block_width;
+      const uint64_t rows =
+          (height + block.block_height - 1u) / block.block_height;
+      info.tiled_slice_stride = columns * rows * block.block_size;
+      info.mip_layout[0] = {
+          0, info.IsVolume() ? info.tiled_slice_stride : guest_size, pitch,
+          static_cast<uint32_t>(rows * block.block_height)};
+      info.mip_layout[0].linear_pitch = pitch;
+      info.mip_layout[0].linear_size =
+          uint64_t{pitch} * height * block.bytes_per_element;
+      return info;
     };
     struct FamilyCase {
       TileBlockFamily family;
@@ -18103,33 +18313,136 @@ public:
 
     u32 case_index = 0;
     auto check_round_trip = [&](const char *stage, uint64_t tiled_size,
-                                std::span<const GpuTileInfo> infos) {
-      uint64_t linear_size = 0;
-      for (const auto &info : infos) {
-        linear_size =
-            std::max(linear_size, info.linear_offset + info.linear_size);
-      }
+                                const ImageInfo &info,
+                                TileManager *manager = nullptr) {
+      const uint64_t linear_size = info.LinearSize();
       std::vector<uint8_t> tiled(tiled_size);
       std::vector<uint8_t> cpu(linear_size, 0);
       std::vector<uint8_t> gpu(linear_size, 0xab);
       fill(&tiled, ++case_index);
-      for (const auto &info : infos) {
-        convert_reference(false, &cpu, tiled, info);
+      for (uint32_t level = 0; level < info.resources.levels; ++level) {
+        convert_reference(false, &cpu, tiled, info, level);
       }
-      gpu_detile(tiled, &gpu, tiled_size, linear_size, infos);
+      gpu_detile(tiled, &gpu, tiled_size, linear_size, info, manager);
       compare((std::string(stage) + " detile bytes").c_str(), cpu, gpu);
-
       std::vector<uint8_t> linear(linear_size);
       std::vector<uint8_t> cpu_tiled(tiled_size, 0xab);
       std::vector<uint8_t> gpu_tiled(tiled_size, 0xab);
       fill(&linear, 0x280u + case_index);
-      for (const auto &info : infos) {
-        convert_reference(true, &cpu_tiled, linear, info);
+      for (uint32_t level = 0; level < info.resources.levels; ++level) {
+        convert_reference(true, &cpu_tiled, linear, info, level);
       }
-      gpu_tile(linear, &gpu_tiled, tiled_size, linear_size, infos);
+      gpu_tile(linear, &gpu_tiled, tiled_size, linear_size, info, manager);
       compare((std::string(stage) + " tile bytes").c_str(), cpu_tiled,
               gpu_tiled);
     };
+
+    {
+      constexpr auto format = Prospero::BufferFormat::k8UNorm;
+      constexpr auto tile = Prospero::TileMode::kStandard256B;
+      constexpr u32 layers = 261;
+      const auto info =
+          MakeTilingImage(format, 1, 1, 1, layers, tile, 0, false);
+      const auto regions = info.BufferCopies();
+      Require(name, "large array mip record",
+              regions.size() == 1 &&
+                  regions[0].imageSubresource.layerCount == layers &&
+                  info.MipExtent(0).depth == layers &&
+                  info.tiled_slice_stride == 256 &&
+                  info.data.size == uint64_t{layers} * 256,
+              "array layers expanded the mip table or lost their guest stride");
+      check_round_trip("large array", info.data.size, info);
+    }
+    {
+      // Adjacent subword mips share output dwords and a guest tail block.
+      TileBlockLayout block{};
+      Require(name, "packed mip block",
+              TileGetBlockLayout(TileBlockFamily::Standard4KB, 1, block),
+              "packed mip block is unavailable");
+      auto info = block_image(block, 1, 1, 1, 1, 4096);
+      info.resources.levels = 16;
+      info.first_tail_level = 0;
+      for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+        info.mip_layout[mip] = {0, 4096, block.block_width, block.block_height};
+        info.mip_layout[mip].linear_offset = mip;
+        info.mip_layout[mip].linear_size = 1;
+        info.mip_layout[mip].linear_pitch = 1;
+        info.mip_layout[mip].tail_x = mip;
+      }
+      check_round_trip("16 packed subword mip records", 4096, info);
+      const auto atom =
+          std::max<uint64_t>(m_runtime_context.GetPhysicalDeviceProperties()
+                                 .limits.nonCoherentAtomSize,
+                             1);
+      for (const auto [mips, bytes] :
+           std::array{std::pair{1u, 64u}, std::pair{2u, 112u}}) {
+        StreamBuffer compact_parameters(m_runtime_context, scheduler,
+                                        MemoryUsage::Stream,
+                                        Common::AlignUp<uint64_t>(bytes, atom));
+        TileManager compact_tiler(m_runtime_context, scheduler,
+                                  compact_parameters);
+        auto compact_info = info;
+        compact_info.resources.levels = mips;
+        check_round_trip("compact parameter buffer", 4096, compact_info,
+                         &compact_tiler);
+      }
+    }
+    {
+      constexpr auto format = Prospero::BufferFormat::k32Float;
+      constexpr auto tile = Prospero::TileMode::kStandard256B;
+      constexpr u32 levels = 7, layers = 3;
+      constexpr uint64_t guest_stride = 0x4800,
+                         guest_size = guest_stride * layers;
+      constexpr uint64_t offsets[levels] = {0x1a00, 0xb00, 0x500, 0x300,
+                                            0x200,  0x100, 0};
+      const auto info = MakeTilingImage(format, 65, 33, levels, layers, tile,
+                                        guest_size, false);
+      const auto regions = info.BufferCopies();
+      bool valid =
+          info.tiled_slice_stride == guest_stride && regions.size() == levels;
+      for (u32 mip = 0; mip < levels && valid; ++mip) {
+        valid &= info.mip_layout[mip].offset == offsets[mip] &&
+                 info.MipExtent(mip).depth == layers &&
+                 regions[mip].imageSubresource.layerCount == layers;
+      }
+      Require(name, "reverse mip array addresses", valid,
+              "mip order or padded guest layer stride changed");
+      check_round_trip("reverse mip array", guest_size, info);
+      std::vector<uint8_t> tiled(guest_size),
+          expected_linear(info.LinearSize(), 0), observed_linear;
+      fill(&tiled, ++case_index);
+      for (u32 mip = 0; mip < levels; ++mip)
+        convert_reference(false, &expected_linear, tiled, info, mip);
+      gpu_detile(tiled, &observed_linear, guest_size, info.LinearSize(), info,
+                 nullptr, 260);
+      compare("detile nonzero source base", expected_linear, observed_linear);
+      const auto saved_mips = info.mip_layout;
+      const auto prefix = info.BufferCopies(256, 2);
+      Require(name, "partial mip array addresses",
+              prefix.size() == 2 && prefix[0].bufferOffset == 256 &&
+                  prefix[1].bufferOffset ==
+                      info.mip_layout[1].linear_offset + 256 &&
+                  info.mip_layout[0].offset == 0x1a00 &&
+                  info.mip_layout[1].offset == 0xb00,
+              "partial mip transfer recomputed the full-chain guest stride");
+      std::vector<uint8_t> linear(info.LinearSize());
+      fill(&linear, ++case_index);
+      for (const u32 count : {2u, levels, 1u, levels}) {
+        std::vector<uint8_t> expected(guest_size, 0xab),
+            observed(guest_size, 0xab);
+        for (u32 mip = 0; mip < count; ++mip)
+          convert_reference(true, &expected, linear, info, mip);
+        gpu_tile(linear, &observed, guest_size, info.LinearSize(), info,
+                 nullptr, count, count == levels ? 516 : 260,
+                 count == levels ? 520 : 264);
+        compare("repeated partial/full transfer", expected, observed);
+        Require(
+            name, "immutable transfer metadata",
+            info.mip_layout == saved_mips && info.resources.levels == levels &&
+                info.tiled_slice_stride == guest_stride,
+            "partial or repeated transfer changed canonical image metadata");
+      }
+    }
     for (const auto family : families) {
       for (u32 bpe = 1; bpe <= family.max_bpe; bpe <<= 1u) {
         TileBlockLayout block{};
@@ -18151,31 +18464,20 @@ public:
             (depth + block.block_depth - 1u) / block.block_depth;
         const uint64_t storage_size =
             block_columns * block_rows * block_slices * block.block_size;
-        const uint64_t slice_stride =
-            static_cast<uint64_t>(pitch) * height * bpe;
-
         std::vector<uint8_t> tiled(storage_size);
         std::vector<uint8_t> cpu(storage_size, 0);
         std::vector<uint8_t> gpu(storage_size, 0xab);
         fill(&tiled, ++case_index);
 
-        GpuTileInfo info{};
-        info.family = block.family;
-        info.bytes_per_element = block.bytes_per_element;
-        info.linear_size = storage_size;
-        info.tiled_size = storage_size;
-        info.linear_slice_stride = volume ? slice_stride : 0;
-        info.width = width;
-        info.height = height;
-        info.depth = depth;
-        info.pitch = pitch;
-        info.surface_z = family.family == TileBlockFamily::RenderTarget64KB ||
-                                 family.family == TileBlockFamily::Depth64KB
-                             ? 3
-                             : 0;
+        auto info =
+            block_image(block, width, height, depth, pitch, storage_size);
+        info.mip_layout[0].surface_z =
+            family.family == TileBlockFamily::RenderTarget64KB ||
+                    family.family == TileBlockFamily::Depth64KB
+                ? 3
+                : 0;
         convert_reference(false, &cpu, tiled, info);
-        gpu_detile(tiled, &gpu, storage_size, storage_size,
-                   std::span<const GpuTileInfo>(&info, 1));
+        gpu_detile(tiled, &gpu, storage_size, storage_size, info);
         const auto family_label = [&](const char *operation) {
           std::ostringstream out;
           out << operation << " family=" << static_cast<u32>(family.family)
@@ -18190,8 +18492,7 @@ public:
           std::vector<uint8_t> gpu_tiled(storage_size, 0xab);
           fill(&linear, 0x80u + case_index);
           convert_reference(true, &cpu_tiled, linear, info);
-          gpu_tile(linear, &gpu_tiled, storage_size, storage_size,
-                   std::span<const GpuTileInfo>(&info, 1));
+          gpu_tile(linear, &gpu_tiled, storage_size, storage_size, info);
           compare(family_label("tile bytes").c_str(), cpu_tiled, gpu_tiled);
         }
       }
@@ -18249,19 +18550,11 @@ public:
               !TileGetTiledTextureLayout(description, invalid),
               "Standard256B volume silently fell back to a 2D array layout");
     }
-    {
-      constexpr auto format = Prospero::BufferFormat::kFmask8_S4_F4;
-      constexpr auto tile = Prospero::TileMode::kStandard64KB;
-      TileSizeAlign total{};
-      TileGetTextureSize(format, 128, 128, 1, tile, &total, nullptr, nullptr);
-      const auto layout = TextureCalcUploadLayout(
-          format, 128, 128, 1, 1, tile, total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      Require(name, "FMASK policy",
-              !TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos),
-              "FMASK entered the texel tiler through a non-depth family");
-    }
+    Require(
+        name, "FMASK policy",
+        Prospero::IsFmaskTextureFormat(Prospero::BufferFormat::kFmask8_S4_F4),
+        "FMASK sample metadata lost its explicit tiler exclusion "
+        "classification");
     u32 format_cases = 0;
     for (u32 raw_format = 1;
          raw_format <= static_cast<uint32_t>(Prospero::BufferFormat::kBc7Srgb);
@@ -18282,36 +18575,27 @@ public:
 
         constexpr u32 width = 67;
         constexpr u32 height = 51;
-        const u32 pitch = TileGetTexturePitch(format, width, mode.tile);
         TileSizeAlign total{};
         TileGetTextureSize(format, width, height, 1, mode.tile, &total, nullptr,
                            nullptr);
         Require(name, "format size", total.size != 0,
                 "supported format has an empty layout");
 
-        const auto layout =
-            TextureCalcUploadLayout(format, width, height, 1, 1, mode.tile,
-                                    total.size, false, name);
-        const auto regions = TextureBuildImageCopies(layout);
-        std::vector<GpuTileInfo> infos;
-        if (!TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos)) {
-          std::ostringstream out;
-          out << "format=" << raw_format
-              << " tile=" << static_cast<uint32_t>(mode.tile)
-              << " size=" << total.size << " pitch=" << pitch;
-          Fail(name, "format infos", out.str());
-        }
+        const auto layout = MakeTilingImage(format, width, height, 1, 1,
+                                            mode.tile, total.size, false);
+        const auto regions = layout.BufferCopies();
         Require(name, "format family",
-                infos.size() == 1 && infos[0].family == mode.family &&
-                    infos[0].bytes_per_element == bpe,
+                layout.resources.levels == 1 &&
+                    layout.tiling.block.family == mode.family &&
+                    layout.tiling.block.bytes_per_element == bpe,
                 "texture info selected the wrong shader family");
 
         std::vector<uint8_t> tiled(total.size);
         std::vector<uint8_t> cpu(total.size, 0);
         std::vector<uint8_t> gpu(total.size, 0xab);
         fill(&tiled, ++case_index);
-        convert_reference(false, &cpu, tiled, infos[0]);
-        gpu_detile(tiled, &gpu, total.size, total.size, infos);
+        convert_reference(false, &cpu, tiled, layout);
+        gpu_detile(tiled, &gpu, total.size, total.size, layout);
         compare("format bytes", cpu, gpu);
         ++format_cases;
       }
@@ -18386,24 +18670,16 @@ public:
       TileSizeAlign total{};
       TileGetTextureSize(format, width, height, levels, tile, &total, nullptr,
                          nullptr);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, 1, tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      const bool built =
-          TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
-      uint64_t linear_size = 0;
-      for (const auto &info : infos) {
-        linear_size =
-            std::max(linear_size, info.linear_offset + info.linear_size);
-      }
+      const auto layout = MakeTilingImage(format, width, height, levels, 1,
+                                          tile, total.size, false);
+      const auto regions = layout.BufferCopies();
+
+      const auto linear_size = layout.LinearSize();
       Require(name, "BC1 mip-tail capacities",
-              built && total.size == 0x10000 &&
-                  layout.surface.first_tail_level == 0 &&
+              total.size == 0x10000 && layout.first_tail_level == 0 &&
                   linear_size == 0x15560 && linear_size > total.size,
               "BC1 mip tail conflated tiled and linear capacities");
-      check_round_trip("BC1 mip tail", total.size, infos);
+      check_round_trip("BC1 mip tail", total.size, layout);
     }
 
     {
@@ -18413,18 +18689,19 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(format, width, height, layers, 1, tile, false,
                               total);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, 1, layers, tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      const bool built =
-          TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos);
+      const auto layout = MakeTilingImage(format, width, height, 1, layers,
+                                          tile, total.size, false);
+      const auto regions = layout.BufferCopies();
+
       Require(name, "array infos",
-              built && infos.size() == layers && infos[0].surface_z == 0 &&
-                  infos[1].surface_z == 1 && infos[2].surface_z == 2,
-              "array slices lost their absolute surface Z");
-      check_round_trip("array", total.size, infos);
+              layout.resources.levels == 1 &&
+                  layout.MipExtent(0).depth == layers &&
+                  layout.mip_layout[0].surface_z == 0 &&
+                  layout.tiled_slice_stride == total.size / layers &&
+                  regions.size() == 1 &&
+                  regions[0].imageSubresource.layerCount == layers,
+              "array mip lost its layer count or absolute surface Z origin");
+      check_round_trip("array", total.size, layout);
     }
 
     for (const auto &mode : standard_modes) {
@@ -18438,21 +18715,25 @@ public:
       TileSizeAlign total{};
       TileGetTextureSize(format, width, height, levels, mode.tile, &total,
                          nullptr, nullptr);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
+      const auto layout = MakeTilingImage(format, width, height, levels, 1,
+                                          mode.tile, total.size, false);
+      const auto regions = layout.BufferCopies();
       Require(name, "odd mip infos",
-              TextureBuildGpuTileInfos(total.size, regions, layout, levels,
-                                       infos) &&
-                  infos.size() == 2 && infos[1].tiled_width >= infos[1].pitch &&
-                  infos[1].tiled_height >= infos[1].height &&
+              layout.resources.levels == 2 &&
+                  layout.mip_layout[1].pitch >=
+                      layout.mip_layout[1].linear_pitch &&
+                  layout.mip_layout[1].height >=
+                      ((layout.MipExtent(1).height +
+                        layout.tiling.texel_height - 1u) /
+                       layout.tiling.texel_height) &&
                   (mode.family == TileBlockFamily::Standard256B ||
-                   infos[1].tiled_height > infos[1].height),
+                   layout.mip_layout[1].height >
+                       ((layout.MipExtent(1).height +
+                         layout.tiling.texel_height - 1u) /
+                        layout.tiling.texel_height)),
               "odd multi-mip physical stride collapsed to the active linear "
               "extent");
-      check_round_trip("odd multi-mip", total.size, infos);
+      check_round_trip("odd multi-mip", total.size, layout);
     }
 
     struct TailMode {
@@ -18477,20 +18758,13 @@ public:
       TileSizeAlign total{};
       TileGetTextureSize(format, width, height, levels, mode.tile, &total,
                          nullptr, nullptr);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
+      const auto layout = MakeTilingImage(format, width, height, levels, 1,
+                                          mode.tile, total.size, false);
+      const auto regions = layout.BufferCopies();
       Require(name, "2D mip tail seam",
-              layout.surface.first_tail_level == 2 &&
-                  TextureBuildGpuTileInfos(total.size, regions, layout, levels,
-                                           infos) &&
-                  infos.size() == levels && !infos[0].tail && !infos[1].tail &&
-                  std::all_of(infos.begin() + 2, infos.end(),
-                              [](const auto &info) { return info.tail; }),
+              layout.first_tail_level == 2 && layout.resources.levels == levels,
               "2D mip chain lost its linear/tiled tail boundary");
-      check_round_trip("2D mip tail seam", total.size, infos);
+      check_round_trip("2D mip tail seam", total.size, layout);
     }
 
     {
@@ -18503,25 +18777,31 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(format, width, height, depth, levels, tile, true,
                               total);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, depth, tile,
-                                  total.size, true, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      const bool built =
-          TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
-      Require(name, "3D mip infos",
-              regions.size() == depth + (depth >> 1u) && built &&
-                  infos.size() == 4 && infos[0].depth == 8 &&
-                  infos[1].depth == 8 && infos[2].depth == 1 &&
-                  infos[3].depth == 8 && infos[0].tiled_offset == 0x19000 &&
-                  infos[1].tiled_offset == 0x83000 &&
-                  infos[2].tiled_offset == 0xed000 &&
-                  infos[3].tiled_offset == 0 && infos[3].pitch == 32 &&
-                  infos[3].height == 64 && infos[3].tiled_width == 40 &&
-                  infos[3].tiled_height == 80,
-              "Standard4KB3D mip depth, packing, or physical stride changed");
-      check_round_trip("3D mip", total.size, infos);
+      const auto layout = MakeTilingImage(format, width, height, levels, depth,
+                                          tile, total.size, true);
+      const auto regions = layout.BufferCopies();
+
+      Require(
+          name, "3D mip infos",
+          regions.size() == levels && layout.resources.levels == levels &&
+              regions[0].imageExtent.depth == depth &&
+              regions[1].imageExtent.depth == (depth >> 1u) &&
+              layout.MipExtent(0).depth == 17 &&
+              layout.MipExtent(1).depth == 8 &&
+              layout.mip_layout[0].offset == 0x19000 &&
+              layout.tiled_slice_stride == 0x6a000 &&
+              layout.mip_layout[0].offset + layout.tiled_slice_stride ==
+                  0x83000 &&
+              layout.mip_layout[0].offset + 2 * layout.tiled_slice_stride ==
+                  0xed000 &&
+              layout.mip_layout[1].offset == 0 &&
+              layout.mip_layout[1].linear_pitch == 32 &&
+              ((layout.MipExtent(1).height + layout.tiling.texel_height - 1u) /
+               layout.tiling.texel_height) == 64 &&
+              layout.mip_layout[1].pitch == 40 &&
+              layout.mip_layout[1].height == 80,
+          "Standard4KB3D mip depth, packing, or physical stride changed");
+      check_round_trip("3D mip", total.size, layout);
     }
 
     {
@@ -18534,19 +18814,21 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(format, width, height, depth, levels, tile, true,
                               total);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, depth, tile,
-                                  total.size, true, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      Require(name, "3D BC mip infos",
-              TextureBuildGpuTileInfos(total.size, regions, layout, levels,
-                                       infos) &&
-                  infos.size() == 4 && infos[3].pitch == 8 &&
-                  infos[3].height == 16 && infos[3].tiled_width == 16 &&
-                  infos[3].tiled_height == 24,
-              "block-compressed 3D mip lost its physical row or slice stride");
-      check_round_trip("3D BC mip", total.size, infos);
+      const auto layout = MakeTilingImage(format, width, height, levels, depth,
+                                          tile, total.size, true);
+      const auto regions = layout.BufferCopies();
+      Require(
+          name, "3D BC mip infos",
+          layout.resources.levels == levels &&
+              layout.MipExtent(0).depth == depth &&
+              layout.MipExtent(1).depth == (depth >> 1u) &&
+              layout.mip_layout[1].linear_pitch == 8 &&
+              ((layout.MipExtent(1).height + layout.tiling.texel_height - 1u) /
+               layout.tiling.texel_height) == 16 &&
+              layout.mip_layout[1].pitch == 16 &&
+              layout.mip_layout[1].height == 24,
+          "block-compressed 3D mip lost its physical row or slice stride");
+      check_round_trip("3D BC mip", total.size, layout);
     }
 
     {
@@ -18556,10 +18838,9 @@ public:
       TileSizeAlign total{};
       TileGetTextureSize(format, width, height, levels, tile, &total, nullptr,
                          nullptr);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, 1, tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
+      const auto layout = MakeTilingImage(format, width, height, levels, 1,
+                                          tile, total.size, false);
+      const auto regions = layout.BufferCopies();
       Require(name, "linear BC native regions",
               regions.size() == levels &&
                   std::all_of(regions.begin(), regions.end(),
@@ -18598,27 +18879,21 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(test.format, width, height, depth, levels,
                               test.tile, true, total);
-      const auto layout =
-          TextureCalcUploadLayout(test.format, width, height, levels, depth,
-                                  test.tile, total.size, true, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      const bool built =
-          TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
+      const auto layout = MakeTilingImage(test.format, width, height, levels,
+                                          depth, test.tile, total.size, true);
+      const auto regions = layout.BufferCopies();
+
       const bool uses_z = test.family == TileBlockFamily::RenderTarget64KB ||
                           test.family == TileBlockFamily::Depth64KB;
       Require(name, "volume family infos",
-              built && !infos.empty() &&
-                  std::all_of(infos.begin(), infos.end(),
-                              [&](const auto &info) {
-                                return info.family == test.family;
-                              }) &&
-                  (!uses_z || std::any_of(infos.begin(), infos.end(),
-                                          [](const auto &info) {
-                                            return info.surface_z != 0;
-                                          })),
+              layout.resources.levels != 0 &&
+                  layout.tiling.block.family == test.family &&
+                  layout.resources.levels == levels &&
+                  layout.MipExtent(0).depth == depth &&
+                  (!uses_z || (layout.mip_layout[0].surface_z == 0 &&
+                               layout.tiled_slice_stride != 0)),
               "volume mode selected the wrong family or lost its surface Z");
-      check_round_trip("volume family", total.size, infos);
+      check_round_trip("volume family", total.size, layout);
     }
 
     struct VolumeTailCase {
@@ -18657,36 +18932,29 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(tail.format, width, height, depth, levels, tile,
                               true, total);
-      const auto layout =
-          TextureCalcUploadLayout(tail.format, width, height, levels, depth,
-                                  tile, total.size, true, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      bool valid = total.size == 8192 &&
-                   regions.size() == depth + std::max(depth >> 1u, 1u) +
-                                         std::max(depth >> 2u, 1u) +
-                                         std::max(depth >> 3u, 1u) +
-                                         std::max(depth >> 4u, 1u) &&
-                   TextureBuildGpuTileInfos(total.size, regions, layout, levels,
-                                            infos) &&
-                   infos.size() == 6;
+      const auto layout = MakeTilingImage(tail.format, width, height, levels,
+                                          depth, tile, total.size, true);
+      const auto regions = layout.BufferCopies();
+      bool valid = total.size == 8192 && regions.size() == levels &&
+                   layout.resources.levels == levels;
       const u32 table = std::countr_zero(tail.bytes);
       for (u32 level = 0; level < levels && valid; level++) {
-        const auto &info = infos[level == 0 ? 0 : level + 1];
-        valid &= info.tail && info.tail_x == volume_tail_xy[table][level][0] &&
-                 info.tail_y == volume_tail_xy[table][level][1] &&
-                 info.tiled_offset == 0;
+        const auto &mip = layout.mip_layout[level];
+        valid &=
+            level >= layout.first_tail_level &&
+            mip.tail_x == volume_tail_xy[table][level][0] &&
+            mip.tail_y == volume_tail_xy[table][level][1] && mip.offset == 0 &&
+            layout.MipExtent(level).depth == std::max(depth >> level, 1u) &&
+            layout.tiled_slice_stride == 4096;
       }
       if (valid) {
-        valid = infos[1].tail &&
-                infos[1].tail_x == volume_tail_xy[table][0][0] &&
-                infos[1].tail_y == volume_tail_xy[table][0][1] &&
-                infos[1].tiled_offset == 4096;
+        valid = layout.MipExtent(0).depth == block.block_depth + 1u &&
+                layout.mip_layout[0].offset + layout.tiled_slice_stride == 4096;
       }
       Require(
           name, "3D mip tail infos", valid,
           "Standard4KB3D mip tail coordinates or block-slice packing changed");
-      check_round_trip("3D mip tail", total.size, infos);
+      check_round_trip("3D mip tail", total.size, layout);
     }
 
     for (const auto family :
@@ -18710,24 +18978,18 @@ public:
         std::vector<uint8_t> cpu(linear_size, 0xcd);
         std::vector<uint8_t> gpu(linear_size, 0xab);
         fill(&tiled, ++case_index);
-        GpuTileInfo info{};
-        info.family = block.family;
-        info.bytes_per_element = block.bytes_per_element;
-        info.linear_size = linear_size;
-        info.tiled_size = block.block_size;
-        info.width = width;
-        info.height = height;
-        info.pitch = pitch;
-        info.tail = true;
-        info.tail_x = x;
-        info.tail_y = y;
-        info.surface_z = family == TileBlockFamily::RenderTarget64KB ||
-                                 family == TileBlockFamily::Depth64KB
-                             ? 2
-                             : 0;
+        auto info =
+            block_image(block, width, height, 1, pitch, block.block_size);
+        info.first_tail_level = 0;
+        info.mip_layout[0].tail_x = x;
+        info.mip_layout[0].tail_y = y;
+        info.mip_layout[0].surface_z =
+            family == TileBlockFamily::RenderTarget64KB ||
+                    family == TileBlockFamily::Depth64KB
+                ? 2
+                : 0;
         convert_reference(false, &cpu, tiled, info);
-        gpu_detile(tiled, &gpu, block.block_size, linear_size,
-                   std::span<const GpuTileInfo>(&info, 1));
+        gpu_detile(tiled, &gpu, block.block_size, linear_size, info);
         compare("tail bytes", cpu, gpu);
 
         std::vector<uint8_t> linear(linear_size);
@@ -18735,8 +18997,7 @@ public:
         std::vector<uint8_t> gpu_tiled(block.block_size, 0xab);
         fill(&linear, 0x400u + case_index);
         convert_reference(true, &cpu_tiled, linear, info);
-        gpu_tile(linear, &gpu_tiled, block.block_size, linear_size,
-                 std::span<const GpuTileInfo>(&info, 1));
+        gpu_tile(linear, &gpu_tiled, block.block_size, linear_size, info);
         compare("tail tile bytes", cpu_tiled, gpu_tiled);
       }
     }
@@ -18749,58 +19010,50 @@ public:
     std::vector<uint8_t> small_expected(small_block.block_size, 0);
     std::vector<uint8_t> small_output(small_block.block_size, 0xab);
     fill(&small_input, 0xee);
-    GpuTileInfo small_info{};
-    small_info.family = small_block.family;
-    small_info.bytes_per_element = small_block.bytes_per_element;
-    small_info.linear_size = small_output.size();
-    small_info.tiled_size = small_input.size();
-    small_info.width = 1;
-    small_info.height = 1;
-    small_info.pitch = small_block.block_width;
+    auto small_info = block_image(small_block, 1, 1, 1, small_block.block_width,
+                                  small_input.size());
     convert_reference(false, &small_expected, small_input, small_info);
     gpu_detile(small_input, &small_output, small_input.size(),
-               small_output.size(),
-               std::span<const GpuTileInfo>(&small_info, 1));
+               small_output.size(), small_info);
     compare("small detile", small_expected, small_output);
 
     std::fill(small_output.begin(), small_output.end(), 0xab);
     gpu_detile(small_input, &small_output, small_input.size(),
-               small_output.size(),
-               std::span<const GpuTileInfo>(&small_info, 1));
+               small_output.size(), small_info);
     compare("scheduler-owned reuse", small_expected, small_output);
 
     constexpr auto volume_format = Prospero::BufferFormat::k32UInt;
     constexpr auto volume_tile = Prospero::TileMode::kLinear;
     constexpr u32 volume_width = 8, volume_height = 4, volume_depth = 5;
     constexpr u32 volume_levels = 3;
-    const u32 volume_pitch =
-        TileGetTexturePitch(volume_format, volume_width, volume_tile);
     TileSizeAlign volume_size{};
     TileGetTextureTotalSize(volume_format, volume_width, volume_height,
                             volume_depth, volume_levels, volume_tile, true,
                             volume_size);
-    const auto volume_layout = TextureCalcUploadLayout(
+    const auto volume_layout = MakeTilingImage(
         volume_format, volume_width, volume_height, volume_levels, volume_depth,
-        volume_tile, volume_size.size, true, name);
-    const auto volume_copies = TextureBuildImageCopies(volume_layout);
+        volume_tile, volume_size.size, true);
+    const auto volume_copies = volume_layout.BufferCopies();
     std::vector<u32> volume_source(volume_size.size / sizeof(u32), 0);
     std::vector<std::pair<size_t, u32>> volume_probes;
     for (const auto &copy : volume_copies) {
-      for (u32 y = 0; y < copy.imageExtent.height; y++) {
-        for (u32 x = 0; x < copy.imageExtent.width; x++) {
-          const auto index =
-              (copy.bufferOffset +
-               (static_cast<uint64_t>(y) * copy.bufferRowLength + x) *
-                   sizeof(u32)) /
-              sizeof(u32);
-          const u32 value =
-              0xa0000000u | (copy.imageSubresource.mipLevel << 24u) |
-              (static_cast<u32>(copy.imageOffset.z) << 16u) | (y << 8u) | x;
-          Require(name, "linear volume native bounds",
-                  index < volume_source.size(),
-                  "linear volume copy escaped its padded guest layout");
-          volume_source[index] = value;
-          volume_probes.emplace_back(static_cast<size_t>(index), value);
+      for (u32 z = 0; z < copy.imageExtent.depth; ++z) {
+        for (u32 y = 0; y < copy.imageExtent.height; ++y) {
+          for (u32 x = 0; x < copy.imageExtent.width; ++x) {
+            const auto index = copy.bufferOffset / sizeof(u32) +
+                               (uint64_t{z} * copy.bufferImageHeight + y) *
+                                   copy.bufferRowLength +
+                               x;
+            const u32 value =
+                0xa0000000u | (copy.imageSubresource.mipLevel << 24u) |
+                ((static_cast<u32>(copy.imageOffset.z) + z) << 16u) |
+                (y << 8u) | x;
+            Require(name, "linear volume native bounds",
+                    index < volume_source.size(),
+                    "linear volume copy escaped its padded guest layout");
+            volume_source[index] = value;
+            volume_probes.emplace_back(static_cast<size_t>(index), value);
+          }
         }
       }
     }
@@ -18810,22 +19063,9 @@ public:
     auto volume_download = CreateHostBuffer(
         name, volume_size.size, vk::BufferUsageFlagBits::eTransferDst,
         std::vector<u32>(volume_source.size(), 0));
-    ImageInfo volume_info{};
-    volume_info.data = {0x10000, volume_size.size};
+    auto volume_info = volume_layout;
+    volume_info.data.address = 0x10000;
     volume_info.pixel_format = vk::Format::eR32Uint;
-    volume_info.guest_format = volume_format;
-    volume_info.type = Prospero::ImageType::kColor3D;
-    volume_info.extent = {volume_width, volume_height, volume_depth};
-    volume_info.resources = {volume_levels, 1};
-    volume_info.pitch = volume_pitch;
-    volume_info.bytes_per_block = sizeof(u32);
-    volume_info.tile_mode = volume_tile;
-    for (u32 level = 0; level < volume_levels; level++) {
-      volume_info.mip_layout[level] = {volume_layout.mips[level].offset,
-                                       volume_layout.mips[level].size,
-                                       volume_layout.mips[level].row_length,
-                                       volume_layout.mips[level].image_height};
-    }
     Libs::Graphics::Image volume_image(m_runtime_context, scheduler,
                                        volume_info);
     volume_image.Upload(volume_copies, volume_upload.buffer, 0,
@@ -21375,6 +21615,66 @@ TestCase ScalarBrevB32PreservesScc() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarZeroBitOps() {
+  using O = ShaderOpcode;
+  constexpr uint64_t inputs[] = {0, UINT64_MAX, 0xaaaaaaaa55555555ull,
+      0xffffffff7fffffffull, 0xfffffffeffffffffull, 0x7fffffffffffffffull,
+      0x00000000ffffffffull, 0xffffffff00000000ull};
+  TestCase test;
+  test.name = "ScalarZeroBitOps";
+  for (const auto input : inputs)
+    test.initial.insert(test.initial.end(), {u32(input), u32(input >> 32)});
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto check = [&](u32 opcode, u32 source, uint64_t input, bool scc) {
+    const u32 width = opcode == 0x0e || opcode == 0x12 ? 64 : 32;
+    u32 count = 0, first = UINT32_MAX;
+    for (u32 bit = 0; bit < width; ++bit) {
+      if (((input >> bit) & 1u) == 0) {
+        ++count;
+        if (first == UINT32_MAX) first = bit;
+      }
+    }
+    const bool counting = opcode == 0x0d || opcode == 0x0e;
+    code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(scc)));
+    code.push_back(EncodeSop1(opcode, 20, source));
+    if (source == 255) code.push_back(u32(input));
+    code.push_back(EncodeSMovB32(22, 253)); // Capture SCC before readback.
+    AppendStoreSgpr(&code, 20, u32(test.expected.size()));
+    AppendStoreSgpr(&code, 21, u32(test.expected.size() + 1));
+    AppendStoreSgpr(&code, 22, u32(test.expected.size() + 2));
+    test.expected.insert(test.expected.end(),
+        {counting ? count : first, u32(input >> 32), u32(counting ? count != 0 : scc)});
+  };
+  for (u32 index = 0; index < std::size(inputs); ++index) {
+    for (u32 word = 0; word < 2; ++word) {
+      AppendVMovU32(&code, 30, (index * 2 + word) * sizeof(u32));
+      AppendBufferLoadDword(&code, 1, 30);
+      code.push_back(EncodeVop1(0x02, 8 + word, Vgpr(1)));
+    }
+    for (const u32 opcode : {0x0du, 0x0eu, 0x11u, 0x12u}) {
+      for (const bool scc : {false, true}) {
+        code.push_back(EncodeSop1(0x04, 20, 8)); // Destination aliases the source.
+        check(opcode, 20, inputs[index], scc);
+      }
+    }
+  }
+  for (const u32 opcode : {0x0du, 0x0eu, 0x11u, 0x12u}) {
+    for (const u32 source : {128u, 193u, 255u}) {
+      const uint64_t input = source == 128 ? 0 : source == 193 ? UINT64_MAX : 0xffffffffull;
+      AppendSMovLiteral(&code, 21, u32(input >> 32));
+      check(opcode, source, input, true); // Only inline -1 sign extends to B64.
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_BCNT0_I32_B32, O::S_BCNT0_I32_B64,
+      O::S_FF0_I32_B32, O::S_FF0_I32_B64, O::S_CMP_EQ_U32, O::S_MOV_B32,
+      O::S_MOV_B64, O::V_MOV_B32, O::V_READFIRSTLANE_B32,
+      O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase ScalarSextMasks(u32 bits, u32 wave_size) {
   using O = ShaderOpcode;
   TestCase test;
@@ -23185,6 +23485,51 @@ TestCase Vop2SdwaMaxI32CapturedHighWord(u32 wave_size) {
                   O::V_MAX_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_MAX_I32 v11, v11, v22.sdwa(sel=5,sext=1)", cases.size()}};
   test.required_spirv = {"OpBitFieldSExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Vop2SdwaMinI32CapturedByte0(u32 wave_size) {
+  using O = ShaderOpcode;
+  struct MinCase { u32 lhs, packed_rhs, expected, exec = 1; };
+  constexpr std::array<MinCase, 9> cases{{
+      {0xfffffffbu, 0x12345678u, 0xfffffffbu},
+      {0x00000064u, 0xffffff80u, 0x00000064u},
+      {0x000000c8u, 0xffffff80u, 0x00000080u},
+      {0x7fffffffu, 0x000000ffu, 0x000000ffu},
+      {0x80000000u, 0x7fffffffu, 0x80000000u},
+      {0x00000100u, 0x00000105u, 0x00000005u},
+      {0xffffffffu, 0x00000000u, 0xffffffffu},
+      {0x00000010u, 0xdeadbe0fu, 0x0000000fu},
+      {0x80000001u, 0x7fff0123u, 0x7fff0123u, 0},
+  }};
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaMinI32Byte0Wave64"
+                             : "Vop2SdwaMinI32Byte0Wave32";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.packed_rhs});
+  }
+  test.initial.resize(cases.size() * 3u, 0xdeadbeefu);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    AppendVMovU32(&code, 30, i * 8u);
+    AppendBufferLoadDword(&code, 5, 30);
+    AppendVMovU32(&code, 30, i * 8u + 4u);
+    AppendBufferLoadDword(&code, 2, 30);
+    code.push_back(EncodeSMovB32(126, InlineU32(cases[i].exec)));
+    code.insert(code.end(), {0x220404f9u, 0x00060605u});
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = cases.size() * 2u + i;
+    AppendStoreVgpr(&code, 2, out);
+    test.expected[out] = cases[i].expected;
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_MIN_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MIN_I32 v2, v5, v2.sdwa(sel=0,sext=0)", cases.size()}};
+  test.required_spirv = {"OpBitFieldUExtract"};
   test.compute_info.wave_size = wave_size;
   test.has_compute_info = true;
   return test;
@@ -25256,11 +25601,12 @@ TestCase VectorPermlane16FetchInactiveFi() {
   return test;
 }
 
-TestCase VectorDpp8Captured(bool masked_exec) {
+TestCase VectorDpp8Captured(bool masked_exec, u32 wave_size = 64, bool fi = false) {
   using O = ShaderOpcode;
   constexpr u32 sentinel = 0xaaaaaaaau;
-  const u32 masks[] = {masked_exec ? 0x0f0f0f0fu : 0xffffffffu,
-                      masked_exec ? 0xf0f0f0f0u : 0xffffffffu};
+  // Both wave halves contain active and inactive lane-3 sources for the ADD.
+  const u32 masks[] = {masked_exec ? 0x0f0ff0f0u : 0xffffffffu,
+                      masked_exec ? 0xf0f00f0fu : 0xffffffffu};
   std::vector<u32> code;
   AppendVMovU32(&code, 5, 100);
   code.push_back(EncodeVop2(0x25, 5, Vgpr(0), 5));
@@ -25269,20 +25615,21 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   AppendVMovLiteral(&code, 3, sentinel);
   AppendVMovLiteral(&code, 8, sentinel);
   AppendSMovLiteral(&code, 126, masks[0]);
-  AppendSMovLiteral(&code, 127, masks[1]);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, masks[1]);
   // Captured DPP8 selectors broadcast each group's upper/lower four lanes.
-  code.push_back(EncodeVop1(0x01, 2, 233));
+  const u32 encoding = fi ? 234u : 233u;
+  code.push_back(EncodeVop1(0x01, 2, encoding));
   code.push_back(0xfacfac05u);
-  code.push_back(EncodeVop1(0x01, 3, 233));
+  code.push_back(EncodeVop1(0x01, 3, encoding));
   code.push_back(0x68868805u);
   // CS 6babb2a8915d35c4, pc 0xcc: add lane 3 of each group to its own v7.
-  code.push_back(0x4a100ee9u);
+  code.push_back(EncodeVop2(0x25, 8, encoding, 7));
   code.push_back(0x6db6db07u);
   AppendSMovLiteral(&code, 126, 0xffffffffu);
-  AppendSMovLiteral(&code, 127, 0xffffffffu);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, 0xffffffffu);
   code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 0));
   AppendBufferStoreDword(&code, 2, 6);
-  AppendVMovU32(&code, 7, 64u * sizeof(u32));
+  AppendVMovU32(&code, 7, wave_size * sizeof(u32));
   code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
   AppendBufferStoreDword(&code, 3, 6);
   code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
@@ -25290,11 +25637,13 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = masked_exec ? "VectorDpp8CapturedMaskedExec"
-                          : "VectorDpp8Captured";
+  const char *names[2][2] = {
+      {"VectorDpp8Wave32MaskedExec", "VectorDpp8Wave64MaskedExec"},
+      {"VectorDpp8FiWave32MaskedExec", "VectorDpp8FiWave64MaskedExec"}};
+  test.name = masked_exec ? names[fi][wave_size == 64] : "VectorDpp8Captured";
   test.code = std::move(code);
-  test.expected.resize(192, sentinel);
-  for (u32 lane = 0; lane < 64; ++lane) {
+  test.expected.resize(3 * wave_size, sentinel);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
     const auto mask = masks[lane / 32u];
     if ((mask & (1u << (lane % 32u))) == 0) {
       continue;
@@ -25303,20 +25652,20 @@ TestCase VectorDpp8Captured(bool masked_exec) {
                            (lane & ~7u) | (lane & 3u)};
     for (u32 permutation = 0; permutation < 2; ++permutation) {
       const auto source = sources[permutation];
-      test.expected[permutation * 64u + lane] =
-          (mask & (1u << (source % 32u))) != 0 ? 100u + source : 0u;
+      test.expected[permutation * wave_size + lane] =
+          fi || (mask & (1u << (source % 32u))) != 0 ? 100u + source : 0u;
     }
     const u32 source = (lane & ~7u) | 3u;
-    test.expected[128u + lane] = 100u + lane;
-    if ((mask & (1u << (source % 32u))) != 0) {
-      test.expected[128u + lane] += 100u + source;
+    test.expected[2 * wave_size + lane] = 100u + lane;
+    if (fi || (mask & (1u << (source % 32u))) != 0) {
+      test.expected[2 * wave_size + lane] += 100u + source;
     }
   }
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32,
                   O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{".dpp8(", 3}};
-  test.compute_info.wave_size = 64;
-  test.compute_info.threads_num[0] = 64;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -25369,6 +25718,56 @@ TestCase VectorDppRowXmask() {
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDppRowShare(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  TestCase test;
+  test.name = wave_size == 32 ? "VectorDppRowShareWave32" : "VectorDppRowShareWave64";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1)); // v1 = 100 + lane.
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  for (u32 selector = 0; selector < 16; ++selector) {
+    for (const bool masked : {false, true}) {
+      const u32 row_mask = masked ? 0xau : 0xfu;
+      const u32 bank_mask = masked ? 0x5u : 0xfu;
+      // Keep the selected source active in every row while masking destination
+      // lanes. Row and bank masks affect destinations, not the shared source.
+      const u32 source_lanes = 0x00010001u << selector;
+      const u32 exec[] = {masked ? 0xaaaaaaaau | source_lanes : 0xffffffffu,
+                          masked ? 0x55555555u | source_lanes : 0xffffffffu};
+      AppendVMovLiteral(&code, 2, sentinel);
+      AppendVMovLiteral(&code, 3, sentinel);
+      AppendSMovLiteral(&code, 126, exec[0]);
+      if (wave_size == 64) AppendSMovLiteral(&code, 127, exec[1]);
+      code.push_back(EncodeVop1(0x01, 2, 250));
+      code.push_back(EncodeVop1Dpp(1, 0x150 + selector, row_mask, bank_mask));
+      code.push_back(EncodeVop2(0x25, 3, 250, 0));
+      code.push_back(EncodeVop2Dpp(1, 0x150 + selector, row_mask, bank_mask));
+      code.push_back(EncodeSop1(0x04, 126, 10));
+      for (const u32 reg : {2u, 3u}) {
+        AppendStoreVgprAtLaneDwordOffset(&code, reg, 0, u32(test.expected.size()));
+        for (u32 lane = 0; lane < wave_size; ++lane) {
+          const bool write = ((row_mask >> (lane / 16)) & 1u) &&
+              ((bank_mask >> ((lane / 4) % 4)) & 1u) &&
+              ((exec[lane / 32] >> (lane % 32)) & 1u);
+          const u32 source = (lane / 16) * 16 + selector;
+          test.expected.push_back(write ? 100 + source + (reg == 3 ? lane : 0) : sentinel);
+        }
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::S_MOV_B64,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   return test;
@@ -26219,9 +26618,10 @@ TestCase VectorCompareInteger64Edges() {
     const auto lhs = pairs[i][0], rhs = pairs[i][1];
     const auto signed_lhs = std::bit_cast<int64_t>(lhs);
     const auto signed_rhs = std::bit_cast<int64_t>(rhs);
-    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 9>{{
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 11>{{
              {0xa0, false}, {0xa1, signed_lhs < signed_rhs},
-             {0xa3, signed_lhs <= signed_rhs}, {0xa5, lhs != rhs}, {0xa7, true},
+             {0xa3, signed_lhs <= signed_rhs}, {0xa4, signed_lhs > signed_rhs},
+             {0xa5, lhs != rhs}, {0xa6, signed_lhs >= signed_rhs}, {0xa7, true},
              {0xe0, false}, {0xe3, lhs <= rhs}, {0xe6, lhs >= rhs}, {0xe7, true}}}) {
       test.code.push_back(EncodeVopc(opcode, Vgpr(1), 3));
       store_mask(106, value);
@@ -26229,17 +26629,40 @@ TestCase VectorCompareInteger64Edges() {
       store_mask(20, value);
     }
     // A negative literal expands by signedness, including equality comparisons.
-    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 5>{{
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 7>{{
              {0xa1, -1 < signed_rhs}, {0xa3, -1 <= signed_rhs},
-             {0xa5, -1 != signed_rhs},
+             {0xa4, -1 > signed_rhs}, {0xa5, -1 != signed_rhs},
+             {0xa6, -1 >= signed_rhs},
              {0xa2, -1 == signed_rhs}, {0xe3, 0xffffffffull <= rhs}}}) {
       test.code.push_back(EncodeVopc(opcode, 255, 3));
       test.code.push_back(0xffffffffu);
       store_mask(106, value);
+      if (opcode == 0xa4 || opcode == 0xa6) {
+        test.code.push_back(EncodeSop1(0x04, 10, 126));
+        test.code.push_back(EncodeVopc(opcode + 0x10, 255, 3));
+        test.code.push_back(0xffffffffu);
+        test.code.push_back(EncodeSop1(0x04, 20, 126));
+        test.code.push_back(EncodeSop1(0x04, 126, 10));
+        store_mask(20, value);
+      }
     }
-    AppendVop3(&test.code, 0xa3, 20, Vgpr(1), 255);
-    test.code.push_back(0xffffffffu);
-    store_mask(20, signed_lhs <= -1);
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 3>{{
+             {0xa3, signed_lhs <= -1}, {0xa4, signed_lhs > -1},
+             {0xa6, signed_lhs >= -1}}}) {
+      for (const u32 source : {255u, 193u}) { // Literal and inline -1.
+        AppendVop3(&test.code, opcode, 20, Vgpr(1), source);
+        if (source == 255) test.code.push_back(0xffffffffu);
+        store_mask(20, value);
+        if (opcode == 0xa4 || opcode == 0xa6) {
+          test.code.push_back(EncodeSop1(0x04, 10, 126));
+          AppendVop3(&test.code, opcode + 0x10, 22, Vgpr(1), source);
+          if (source == 255) test.code.push_back(0xffffffffu);
+          test.code.push_back(EncodeSop1(0x04, 20, 126));
+          test.code.push_back(EncodeSop1(0x04, 126, 10));
+          store_mask(20, value);
+        }
+      }
+    }
     test.code.push_back(EncodeSop1(0x04, 10, 126));
     AppendVop3(&test.code, 0xb2, 126, 255, Vgpr(3)); // CMPX_EQ_I64 sign-extends -1.
     test.code.push_back(0xffffffffu);
@@ -26262,7 +26685,8 @@ TestCase VectorCompareInteger64Edges() {
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
                   O::V_CMP_F_I64, O::V_CMP_LT_I64, O::V_CMP_LE_I64, O::V_CMP_EQ_I64,
-                  O::V_CMP_NE_I64, O::V_CMP_T_I64, O::V_CMPX_EQ_I64,
+                  O::V_CMP_GT_I64, O::V_CMP_NE_I64, O::V_CMP_GE_I64,
+                  O::V_CMP_T_I64, O::V_CMPX_EQ_I64, O::V_CMPX_GT_I64, O::V_CMPX_GE_I64,
                   O::V_CMP_F_U64, O::V_CMP_LE_U64, O::V_CMP_GE_U64, O::V_CMP_T_U64,
                   O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpSLessThan", "OpULessThanEqual", "OpUGreaterThanEqual"};
@@ -26272,7 +26696,7 @@ TestCase VectorCompareInteger64Edges() {
 TestCase VectorCompareExecWaveMasks(u32 wave_size) {
   using O = ShaderOpcode;
   // Rows exercise signed 16-bit truncation, full-width integer ordering, and
-  // ordered FP64 comparisons (including NaN, signed zero, and subnormals).
+  // ordered/unordered FP64 comparisons (including NaN, signed zero, and subnormals).
   constexpr std::array<std::array<std::array<uint64_t, 2>, 8>, 3> inputs{{
       {{{0x1111ffff, 0x22220000}, {0x33338000, 0x44447fff},
         {0x55550000, 0x66660000}, {0x77777fff, 0x88888000},
@@ -26287,17 +26711,21 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
         {0xc000000000000000ull, 0xbff0000000000000ull},
         {0x7ff0000000000000ull, 0x7ff0000000000000ull},
         {0x3ff0000000000001ull, 0x3ff0000000000000ull}}}}};
-  struct Compare { u32 encoding; O opcode; u32 group; };
+  struct Compare { u32 encoding; O opcode; u32 group; bool update_exec{true}; };
   constexpr std::array comparisons{
       Compare{0x99, O::V_CMPX_LT_I16, 0}, Compare{0x9a, O::V_CMPX_EQ_I16, 0},
       Compare{0x9b, O::V_CMPX_LE_I16, 0}, Compare{0x9c, O::V_CMPX_GT_I16, 0},
       Compare{0x9d, O::V_CMPX_NE_I16, 0}, Compare{0x9e, O::V_CMPX_GE_I16, 0},
       Compare{0xb0, O::V_CMPX_F_I64, 1}, Compare{0xb1, O::V_CMPX_LT_I64, 1},
       Compare{0xb2, O::V_CMPX_EQ_I64, 1}, Compare{0xb3, O::V_CMPX_LE_I64, 1},
+      Compare{0xb4, O::V_CMPX_GT_I64, 1}, Compare{0xb6, O::V_CMPX_GE_I64, 1},
+      Compare{0xa4, O::V_CMP_GT_I64, 1, false},
+      Compare{0xa6, O::V_CMP_GE_I64, 1, false},
       Compare{0xb7, O::V_CMPX_T_I64, 1}, Compare{0xf0, O::V_CMPX_F_U64, 1},
       Compare{0xf1, O::V_CMPX_LT_U64, 1}, Compare{0xf2, O::V_CMPX_EQ_U64, 1},
       Compare{0xf3, O::V_CMPX_LE_U64, 1}, Compare{0xf4, O::V_CMPX_GT_U64, 1},
       Compare{0xf6, O::V_CMPX_GE_U64, 1}, Compare{0xf7, O::V_CMPX_T_U64, 1},
+      Compare{0x30, O::V_CMPX_F_F64, 2}, Compare{0x3f, O::V_CMPX_TRU_F64, 2},
       Compare{0x33, O::V_CMPX_LE_F64, 2}, Compare{0x36, O::V_CMPX_GE_F64, 2},
       Compare{0x31, O::V_CMPX_LT_F64, 2}, Compare{0x32, O::V_CMPX_EQ_F64, 2},
       Compare{0x34, O::V_CMPX_GT_F64, 2}, Compare{0x35, O::V_CMPX_LG_F64, 2},
@@ -26318,8 +26746,6 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
   test.expected = test.initial;
   auto& code = test.code;
   code.push_back(EncodeSop1(0x04, 10, 126));
-  AppendSMovLiteral(&code, 106, vcc_lo);
-  AppendSMovLiteral(&code, 107, vcc_hi);
   for (const auto compare : comparisons) {
     for (u32 word = 0; word < 4; ++word) {
       code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
@@ -26332,6 +26758,8 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
       const auto pair = inputs[compare.group][lane % 8];
       const auto a = std::bit_cast<int16_t>(uint16_t(pair[0]));
       const auto b = std::bit_cast<int16_t>(uint16_t(pair[1]));
+      const auto lhs = std::bit_cast<double>(pair[0]);
+      const auto rhs = std::bit_cast<double>(pair[1]);
       bool result = false;
       switch (compare.encoding) {
         case 0x99: result = a < b; break;
@@ -26340,63 +26768,61 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
         case 0x9c: result = a > b; break;
         case 0x9d: result = a != b; break;
         case 0x9e: result = a >= b; break;
-        case 0xb0: case 0xf0: result = false; break;
+        case 0x30: case 0xb0: case 0xf0: result = false; break;
         case 0xb1: result = std::bit_cast<int64_t>(pair[0]) < std::bit_cast<int64_t>(pair[1]); break;
         case 0xb2: case 0xf2: result = pair[0] == pair[1]; break;
         case 0xb3: result = std::bit_cast<int64_t>(pair[0]) <= std::bit_cast<int64_t>(pair[1]); break;
-        case 0xb7: case 0xf7: result = true; break;
+        case 0xa4: case 0xb4: result = std::bit_cast<int64_t>(pair[0]) > std::bit_cast<int64_t>(pair[1]); break;
+        case 0xa6: case 0xb6: result = std::bit_cast<int64_t>(pair[0]) >= std::bit_cast<int64_t>(pair[1]); break;
+        case 0x3f: case 0xb7: case 0xf7: result = true; break;
         case 0xf1: result = pair[0] < pair[1]; break;
         case 0xf3: result = pair[0] <= pair[1]; break;
         case 0xf4: result = pair[0] > pair[1]; break;
         case 0xf6: result = pair[0] >= pair[1]; break;
-        case 0x33: result = std::bit_cast<double>(pair[0]) <= std::bit_cast<double>(pair[1]); break;
-        case 0x36: result = std::bit_cast<double>(pair[0]) >= std::bit_cast<double>(pair[1]); break;
-        case 0x31: result = std::bit_cast<double>(pair[0]) < std::bit_cast<double>(pair[1]); break;
-        case 0x32: result = std::bit_cast<double>(pair[0]) == std::bit_cast<double>(pair[1]); break;
-        case 0x34: result = std::bit_cast<double>(pair[0]) > std::bit_cast<double>(pair[1]); break;
-        case 0x35: {
-          const auto lhs = std::bit_cast<double>(pair[0]);
-          const auto rhs = std::bit_cast<double>(pair[1]);
-          result         = lhs < rhs || lhs > rhs; // ordered "<>": false if either is NaN.
-          break;
-        }
-        case 0x37:
-          result = !std::isnan(std::bit_cast<double>(pair[0])) &&
-                    !std::isnan(std::bit_cast<double>(pair[1]));
-          break;
-        case 0x38:
-          result = std::isnan(std::bit_cast<double>(pair[0])) ||
-                    std::isnan(std::bit_cast<double>(pair[1]));
-          break;
+        case 0x33: result = lhs <= rhs; break;
+        case 0x36: result = lhs >= rhs; break;
+        case 0x31: result = lhs < rhs; break;
+        case 0x32: result = lhs == rhs; break;
+        case 0x34: result = lhs > rhs; break;
+        case 0x35: result = lhs < rhs || lhs > rhs; break;
+        case 0x37: result = !std::isnan(lhs) && !std::isnan(rhs); break;
+        case 0x38: result = std::isnan(lhs) || std::isnan(rhs); break;
         // The N* predicates are the logical negation of their ordered counterpart,
         // which is true for any comparison involving a NaN (IEEE unordered compares).
-        case 0x39: result = !(std::bit_cast<double>(pair[0]) >= std::bit_cast<double>(pair[1])); break;
-        case 0x3a: {
-          const auto lhs = std::bit_cast<double>(pair[0]);
-          const auto rhs = std::bit_cast<double>(pair[1]);
-          result         = !(lhs < rhs || lhs > rhs);
-          break;
-        }
-        case 0x3b: result = !(std::bit_cast<double>(pair[0]) > std::bit_cast<double>(pair[1])); break;
-        case 0x3c: result = !(std::bit_cast<double>(pair[0]) <= std::bit_cast<double>(pair[1])); break;
-        case 0x3d: result = !(std::bit_cast<double>(pair[0]) == std::bit_cast<double>(pair[1])); break;
-        case 0x3e: result = !(std::bit_cast<double>(pair[0]) < std::bit_cast<double>(pair[1])); break;
+        case 0x39: result = !(lhs >= rhs); break;
+        case 0x3a: result = !(lhs < rhs || lhs > rhs); break;
+        case 0x3b: result = !(lhs > rhs); break;
+        case 0x3c: result = !(lhs <= rhs); break;
+        case 0x3d: result = !(lhs == rhs); break;
+        case 0x3e: result = !(lhs < rhs); break;
       }
       if (result) expected_exec[lane / 32] |= 1u << (lane % 32);
     }
     expected_exec[0] &= low_exec;
     expected_exec[1] &= high_exec;
     for (const bool vop3 : {false, true}) {
+      AppendSMovLiteral(&code, 106, vcc_lo);
+      AppendSMovLiteral(&code, 107, vcc_hi);
+      AppendSMovLiteral(&code, 22, vcc_lo);
+      AppendSMovLiteral(&code, 23, vcc_hi);
       AppendSMovLiteral(&code, 126, low_exec);
       if (wave_size == 64) AppendSMovLiteral(&code, 127, high_exec);
-      if (vop3) AppendVop3(&code, compare.encoding, 20, Vgpr(1), Vgpr(3));
+      if (vop3) AppendVop3(&code, compare.encoding, 22, Vgpr(1), Vgpr(3));
       else code.push_back(EncodeVopc(compare.encoding, Vgpr(1), 3));
       code.push_back(EncodeSMovB32(20, 126));
       code.push_back(EncodeSMovB32(21, 127));
       code.push_back(EncodeSop1(0x04, 126, 10));
-      for (const auto [reg, value] : std::array<std::pair<u32, u32>, 4>{{
-               {20, expected_exec[0]}, {21, expected_exec[1]},
-               {106, vcc_lo}, {107, vcc_hi}}}) {
+      const bool vcc_dest = !compare.update_exec && !vop3;
+      const bool sgpr_dest = !compare.update_exec && vop3;
+      // Wave32 writes only the low half of VCC or the selected SGPR pair.
+      const u32 mask_hi = wave_size == 64 ? expected_exec[1] : vcc_hi;
+      for (const auto [reg, value] : std::array<std::pair<u32, u32>, 6>{{
+               {20, compare.update_exec ? expected_exec[0] : low_exec},
+               {21, compare.update_exec ? expected_exec[1] : (wave_size == 64 ? high_exec : 0)},
+               {106, vcc_dest ? expected_exec[0] : vcc_lo},
+               {107, vcc_dest ? mask_hi : vcc_hi},
+               {22, sgpr_dest ? expected_exec[0] : vcc_lo},
+               {23, sgpr_dest ? mask_hi : vcc_hi}}}) {
         AppendStoreSgprAtLaneDwordOffset(&code, reg, 0, u32(test.expected.size()));
         test.expected.insert(test.expected.end(), wave_size, value);
       }
@@ -26422,7 +26848,7 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
 
 TestCase VectorCompareF64Edges() {
   using O = ShaderOpcode;
-  constexpr std::array<std::array<uint64_t, 2>, 15> pairs{{
+  constexpr std::array<std::array<uint64_t, 2>, 16> pairs{{
       {0xc000000000000000ull, 0xbff0000000000000ull},
       {0x8000000000000001ull, 0}, {0x3fc45f306dc9c882ull, 0x3fc45f306dc9c882ull},
       {0, 0x8000000000000000ull}, {1, 0}, {1, 1}, {1, 2},
@@ -26431,7 +26857,8 @@ TestCase VectorCompareF64Edges() {
       {0x7ff0000000000000ull, 0x7ff0000000000000ull},
       {0x7ff0000000000000ull, 0xfff0000000000000ull},
       {0x7ff8000000000001ull, 0x7ff8000000000001ull},
-      {0x7ff0000000000001ull, 0}, {0x7fefffffffffffffull, 0x7fefffffffffffffull}}};
+      {0x7ff0000000000001ull, 0}, {0, 0x7ff8000000000001ull},
+      {0x7fefffffffffffffull, 0x7fefffffffffffffull}}};
   TestCase test;
   test.name = "VectorCompareF64Edges";
   for (const auto& pair : pairs)
@@ -26449,31 +26876,28 @@ TestCase VectorCompareF64Edges() {
     }
     const auto lhs = std::bit_cast<double>(pairs[i][0]);
     const auto rhs = std::bit_cast<double>(pairs[i][1]);
-    test.code.push_back(EncodeVopc(0x22, Vgpr(1), 3));
-    store_mask(106, lhs == rhs);
-    test.code.push_back(EncodeVopc(0x23, Vgpr(1), 3));
-    store_mask(106, lhs <= rhs);
-    test.code.push_back(EncodeVopc(0x21, Vgpr(1), 3));
-    store_mask(106, lhs < rhs);
-    test.code.push_back(EncodeVopc(0x24, Vgpr(1), 3));
-    store_mask(106, lhs > rhs);
-    test.code.push_back(EncodeVopc(0x25, Vgpr(1), 3));
-    store_mask(106, lhs < rhs || lhs > rhs); // ordered "<>": false if either is NaN.
-    test.code.push_back(EncodeVopc(0x27, Vgpr(1), 3));
-    store_mask(106, !std::isnan(lhs) && !std::isnan(rhs));
-    test.code.push_back(EncodeVopc(0x28, Vgpr(1), 3));
-    store_mask(106, std::isnan(lhs) || std::isnan(rhs));
-    test.code.push_back(EncodeVopc(0x2du, Vgpr(1), 3));
-    store_mask(106, !(lhs == rhs)); // NEQ: unordered-or-not-equal.
-    AppendVop3(&test.code, 0x23, 20, Vgpr(1), Vgpr(3), 0, 1, 0, false, 0, 1);
-    store_mask(20, -std::abs(lhs) <= rhs);
+    for (const bool vop3 : {false, true}) {
+      const auto a = vop3 ? -std::abs(lhs) : lhs;
+      const auto b = vop3 ? -std::abs(rhs) : rhs;
+      const bool ordered = !std::isnan(a) && !std::isnan(b);
+      // Predicates 0x20..0x2f; N* is the negation of its ordered counterpart.
+      const std::array results{false, a < b, a == b, a <= b, a > b,
+          a < b || a > b, a >= b, ordered, !ordered, !(a >= b),
+          !(a < b || a > b), !(a > b), !(a <= b), !(a == b), !(a < b), true};
+      for (u32 predicate = 0; predicate < results.size(); ++predicate) {
+        if (vop3)
+          AppendVop3(&test.code, 0x20 + predicate, 20, Vgpr(1), Vgpr(3),
+                     0, 3, 0, false, 0, 3);
+        else
+          test.code.push_back(EncodeVopc(0x20 + predicate, Vgpr(1), 3));
+        store_mask(vop3 ? 20 : 106, results[predicate]);
+      }
+    }
     test.code.push_back(EncodeVopc(0x23, 255, 3));
     test.code.push_back(0x3ff00000u); // FP64 literals supply the high word.
     store_mask(106, 1.0 <= rhs);
     AppendVop3(&test.code, 0x23, 20, 248, Vgpr(3));
     store_mask(20, std::bit_cast<double>(uint64_t{0x3fc45f306dc9c882ull}) <= rhs);
-    AppendVop3(&test.code, 0x22, 20, Vgpr(1), Vgpr(3), 0, 1, 0, false, 0, 1);
-    store_mask(20, -std::abs(lhs) == rhs);
     test.code.push_back(EncodeVop1(0x02, 100, Vgpr(3)));
     test.code.push_back(EncodeVop1(0x02, 101, Vgpr(4)));
     // Captured e6d76d24f59f8015 PC 0xe4: compare zero with s100:s101.
@@ -26485,12 +26909,16 @@ TestCase VectorCompareF64Edges() {
   AppendEnd(&test.code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
-                  O::V_CMP_EQ_F64, O::V_CMP_LE_F64, O::V_CMP_LT_F64, O::V_CMP_GT_F64,
-                  O::V_CMP_LG_F64, O::V_CMP_O_F64, O::V_CMP_U_F64, O::V_CMP_NEQ_F64,
+                  O::V_CMP_F_F64, O::V_CMP_LT_F64, O::V_CMP_EQ_F64, O::V_CMP_LE_F64,
+                  O::V_CMP_GT_F64, O::V_CMP_LG_F64, O::V_CMP_GE_F64, O::V_CMP_O_F64,
+                  O::V_CMP_U_F64, O::V_CMP_NGE_F64, O::V_CMP_NLG_F64, O::V_CMP_NGT_F64,
+                  O::V_CMP_NLE_F64, O::V_CMP_NEQ_F64, O::V_CMP_NLT_F64, O::V_CMP_TRU_F64,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64",   "OpFOrdEqual",
-                         "OpFOrdLessThanEqual",  "OpFOrdLessThan",   "OpFOrdGreaterThan",
-                         "OpFOrdNotEqual",       "OpFUnordNotEqual"};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "OpIsNan",
+                         "OpFOrdEqual", "OpFOrdNotEqual", "OpFOrdLessThan",
+                         "OpFOrdLessThanEqual", "OpFOrdGreaterThan", "OpFOrdGreaterThanEqual",
+                         "OpFUnordEqual", "OpFUnordNotEqual", "OpFUnordLessThan",
+                         "OpFUnordLessThanEqual", "OpFUnordGreaterThan", "OpFUnordGreaterThanEqual"};
   return test;
 }
 
@@ -35611,6 +36039,122 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+void CheckFiniteInlineSamplerPhi(VulkanHarness &vulkan) {
+  TestCase test;
+  test.name = "FiniteInlineSamplerPhi";
+  auto &code = test.code;
+  code.insert(code.end(), {EncodeSop1(0x04, 36, InlineU32(0)),
+      EncodeSop1(0x04, 38, InlineU32(0)), EncodeSop1(0x04, 24, 126),
+      EncodeVop1(0x01, 10, 16), EncodeVopc(0xd5, InlineU32(0), 10)});
+  const auto skip_sampler = code.size();
+  code.push_back(EncodeSopp(0x08));
+  // Actual correlated inline sampler words from 905b2e2c: zero or {0,fff000,a500000,0}.
+  code.insert(code.end(), {EncodeSop2(0x24, 37, InlineU32(12), InlineU32(12)),
+      EncodeSop1(0x04, 38, 255), 0x0a500000u});
+  code[skip_sampler] = EncodeSopp(0x08, code.size() - skip_sampler - 1u);
+  code.push_back(EncodeSop1(0x04, 126, 24));
+  AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&code, 21, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&code, 1, 0x12345678u);
+  AppendVMovLiteral(&code, 2, 0x87654321u);
+  code.insert(code.end(), {EncodeVopc(0xd4, InlineU32(2), 10),
+      EncodeMimg0(0x27, 1), EncodeMimg1(1, 20, 0, 9),
+      EncodeMimg0(0x27, 1), EncodeMimg1(2, 20, 2, 9),
+      EncodeSop1(0x04, 126, 24), EncodeVop1(0x01, 30, 16),
+      EncodeVop2(0x1a, 31, InlineU32(3), 30),
+      EncodeMubuf0(0x1c), EncodeMubuf1(1, 12, 31),
+      EncodeMubuf0(0x1c, 4), EncodeMubuf1(2, 12, 31)});
+  AppendEnd(&code);
+  test.initial.assign(7, 0xa5a5a5a5u);
+  test.expected = {std::bit_cast<u32>(4.0f), 0xfffffff9u,
+      std::bit_cast<u32>(2.0f), 0xfffffff9u, 0x12345678u, 0x87654321u, 0xa5a5a5a5u};
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[3] |= static_cast<u32>(Prospero::ImageType::kColor2D) << 28u;
+  const auto signed_image = MakeSampledTextureData(Prospero::BufferFormat::k32SInt);
+  std::copy_n(signed_image.begin(), 8, test.user_data.begin() + 8);
+  test.user_data[11] |= static_cast<u32>(Prospero::ImageType::kColor2D) << 28u;
+  test.user_data[50] = test.initial.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 16;
+  test.has_compute_info = true;
+  test.dispatch_x = 3;
+  test.opcodes = {ShaderOpcode::S_MOV_B64, ShaderOpcode::S_BFM_B32,
+      ShaderOpcode::S_CBRANCH_EXECZ, ShaderOpcode::V_MOV_B32, ShaderOpcode::V_CMPX_NE_U32,
+      ShaderOpcode::V_CMPX_GT_U32, ShaderOpcode::V_LSHLREV_B32,
+      ShaderOpcode::IMAGE_SAMPLE, ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.required_spirv = {"OpPhi", "NonUniform", "OpImageSampleExplicitLod"};
+  auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  std::set<u32> nonuniform_ids;
+  std::vector<std::pair<u32, u32>> sampled_ids;
+  for (size_t offset = 5; offset < compiled.spirv.size();) {
+    const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+    if (static_cast<spv::Op>(words[0] & 0xffffu) == spv::OpDecorate &&
+        words[2] == spv::DecorationNonUniform) nonuniform_ids.insert(words[1]);
+    if (static_cast<spv::Op>(words[0] & 0xffffu) == spv::OpSampledImage)
+      sampled_ids.emplace_back(words[2], words[4]);
+    offset += words.size();
+  }
+  Require(test.name, "dynamic sampler decorations", sampled_ids.size() >= 2 &&
+              std::ranges::all_of(sampled_ids, [&](const auto &ids) {
+                return nonuniform_ids.contains(ids.first) && nonuniform_ids.contains(ids.second);
+              }),
+          "fetched sampler or sampled image lost its NonUniform decoration");
+  const auto &samplers = compiled.program.info.samplers;
+  u32 roots = 0;
+  for (const auto &root : samplers) {
+    if (root.indirect_resources.empty()) continue;
+    ++roots;
+    Require(test.name, "correlated sampler candidates", root.indirect_resources.size() == 2,
+            "finite sampler was folded or lost a correlated branch state");
+    for (const auto child : root.indirect_resources)
+      Require(test.name, "sampler class remapping", child < samplers.size() &&
+                  samplers[child].force_point_filtering == root.force_point_filtering &&
+                  samplers[child].integer_border == root.integer_border,
+              "a finite candidate retained another image class's sampler");
+  }
+  Require(test.name, "finite sampler class variants", roots == 2 && samplers.size() == 4 &&
+              compiled.resources.samplers.size() == 2,
+          "the two-state sampler did not retain both float and signed image classes");
+  constexpr std::array<u32, 4> zero_sampler{};
+  constexpr std::array<u32, 4> linear_sampler{0, 0x00fff000u, 0x0a500000u, 0};
+  Require(test.name, "inline sampler states",
+          std::ranges::all_of(compiled.resources.samplers, [&](const auto &value) {
+            return std::equal(zero_sampler.begin(), zero_sampler.end(), value.dwords.begin()) ||
+                std::equal(linear_sampler.begin(), linear_sampler.end(), value.dwords.begin());
+          }) && compiled.resources.samplers[0] != compiled.resources.samplers[1],
+          "descriptor words were mixed between the two native sampler states");
+  auto pixels = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4; ++y)
+    for (u32 x = 2; x < 4; ++x) SetRgbaPixel(&pixels, 4, x, y, std::bit_cast<u32>(4.0f), 0, 0, 0);
+  std::array<VulkanHarness::Image, 2> images{
+      vulkan.CreateImageMips(test.name, 4, 4, vk::Format::eR32G32B32A32Sfloat,
+          vk::ImageUsageFlagBits::eSampled, {pixels}, 4, vk::ImageLayout::eShaderReadOnlyOptimal,
+          vk::ImageType::e2D, vk::ImageViewType::e2D, 1),
+      vulkan.CreateImageMips(test.name, 4, 4, vk::Format::eR32Sint,
+          vk::ImageUsageFlagBits::eSampled, {std::vector<u32>(16, 0xfffffff9u)}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D, vk::ImageViewType::e2D, 1)};
+  std::vector<vk::Sampler> native_samplers;
+  for (const auto &resource : samplers) {
+    ShaderSamplerResource descriptor{};
+    std::copy_n(compiled.resources.samplers[resource.snapshot_index].dwords.begin(), 4, descriptor.fields);
+    const auto filter = !resource.force_point_filtering && descriptor.XyMagFilter() == 1
+        ? vk::Filter::eLinear : vk::Filter::eNearest;
+    native_samplers.push_back(vulkan.CreateSampler(test.name, 1, filter));
+  }
+  auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+  vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, images, native_samplers);
+  CompareWords(test, "point, linear, remapped signed sampler and inactive output", test.expected,
+      vulkan.ReadBuffer(test.name, output, test.expected.size()));
+  vulkan.DestroyBuffer(&output);
+  for (const auto sampler : native_samplers) vulkan.Device().destroySampler(sampler);
+  for (auto &image : images) vulkan.DestroyImage(&image);
+  std::printf("[compute] %-32s ok\n", test.name);
+}
+
 void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
@@ -35856,42 +36400,87 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   std::vector<VulkanHarness::Image> textures;
   for (u32 resource = 0; resource < 7u; ++resource) {
     const auto layers = resource == 4u ? 6u : 1u;
-    std::vector<u32> pixels(layers * 4u, std::bit_cast<u32>(float(resource)));
+    std::vector<u32> pixels(layers * 16u, std::bit_cast<u32>(float(resource)));
+    std::vector<u32> mip(layers * 4u,
+                         std::bit_cast<u32>(resource == 0u ? 0.0f : float(resource + 10u)));
     textures.push_back(vulkan.CreateImageMips(
-        test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
-        vk::ImageUsageFlagBits::eSampled, {pixels}, 4u,
+        test.name, 2, 2, vk::Format::eR32G32B32A32Sfloat,
+        vk::ImageUsageFlagBits::eSampled, {pixels, mip}, 4u,
         vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
         resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers));
   }
   const auto native_sampler = vulkan.CreateSampler(test.name);
-  for (const u32 wave_size : {32u, 64u}) {
-    compute.wave_size = wave_size;
-    compute.host_subgroup_size = vulkan.SubgroupSize();
-    compute.threads_num[0] = wave_size;
-    compute.threads_num[1] = compute.threads_num[2] = 1u;
-    compiled.program.wave_size = wave_size;
-    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
-    compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
-    ValidateSpirv(test.name, compiled.spirv);
-    const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
-    Require(test.name, "native array run samples", tools.Disassemble(compiled.spirv, &text) &&
-                CountText(text, "OpImageSampleExplicitLod") == 3u * halves,
-            "mixed runs expanded into per-image samples");
-    test.initial.assign(wave_size, 0xdeadbeefu);
-    test.expected.assign(wave_size, 0u);
-    for (u32 lane = 0; lane < ordinals.size(); ++lane) {
-      test.expected[lane] = std::bit_cast<u32>(float(root.indirect_resources[ordinals[lane]]));
+  for (const bool fetch : {false, true}) {
+    if (fetch) {
+      test.name = "IndirectImageFetchContiguousRuns";
+      const auto position = std::ranges::find_if(*block, [&](const Inst &inst) {
+        return &inst == &sample;
+      });
+      auto &read = *block->PrependNewInst(
+          position, ValueOpcode::ImageRead,
+          {Value(&image), Value(&address), Value(true)}, memory_flag_bits);
+      sample.ReplaceUsesWith(Value(&read), false);
+      sampler.Invalidate();
+      compiled.program.info.samplers.clear();
+      compiled.program.info.sampled_pairs.clear();
+      compiled.program.info.images[4].cube = false;
+      compiled.program.memory_info[0].image_sample_flags = 0;
+      compiled.program.memory_info[0].image_has_mip = true;
+      for (u32 component = 0; component < 4u; ++component)
+        address.SetArg(component, Value(0u));
+      // Native DIM=2DArray places LOD after the layer, even for a 2D candidate.
+      address.SetArg(3, Value(1u));
+      compiled.program.shader_info_complete = false;
+      CollectShaderInfo(compiled.program, {.compute = &compute});
     }
-    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
-    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
-                    native_sampler, textures);
-    const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
-    vulkan.DestroyBuffer(&buffer);
-    CompareWords(test, "root, native slots, cube and mapping bounds", test.expected, actual);
+    for (const u32 wave_size : {32u, 64u}) {
+      compute.wave_size = wave_size;
+      compute.host_subgroup_size = vulkan.SubgroupSize();
+      compute.threads_num[0] = wave_size;
+      compute.threads_num[1] = compute.threads_num[2] = 1u;
+      compiled.program.wave_size = wave_size;
+      compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+      compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+      ValidateSpirv(test.name, compiled.spirv);
+      const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      Require(test.name, "native array image runs", tools.Disassemble(compiled.spirv, &text) &&
+                  CountText(text, fetch ? "OpImageFetch" : "OpImageSampleExplicitLod") == 3u * halves,
+              "mixed runs expanded into per-image accesses");
+      if (fetch) {
+        std::vector<u32> decorated;
+        std::vector<u32> fetched_images;
+        for (size_t offset = 5; offset < compiled.spirv.size();) {
+          const auto words = std::span<const u32>(compiled.spirv).subspan(
+              offset, compiled.spirv[offset] >> 16u);
+          const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
+            decorated.push_back(words[1]);
+          if (opcode == spv::OpImageFetch) fetched_images.push_back(words[3]);
+          offset += words.size();
+        }
+        Require(test.name, "nonuniform fetch operands",
+                std::ranges::count_if(fetched_images, [&](u32 operand) {
+                  return std::ranges::find(decorated, operand) != decorated.end();
+                }) == 2u * halves,
+                "a dynamically selected fetch image lacks its nonuniform decoration");
+      }
+      test.initial.assign(wave_size, 0xdeadbeefu);
+      test.expected.assign(wave_size, 0u);
+      for (u32 lane = 0; lane < ordinals.size(); ++lane) {
+        const auto resource = root.indirect_resources[ordinals[lane]];
+        test.expected[lane] = std::bit_cast<u32>(float(resource + (fetch && resource != 0u ? 10u : 0u)));
+      }
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
+                      fetch ? vk::Sampler{} : native_sampler, textures);
+      const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+      vulkan.DestroyBuffer(&buffer);
+      CompareWords(test, "root, native slots, cube and mapping bounds", test.expected, actual);
+    }
+    std::printf("[compute] %-32s ok\n", test.name);
   }
   vulkan.Device().destroySampler(native_sampler);
   for (auto &texture : textures) vulkan.DestroyImage(&texture);
-  std::printf("[compute] %-32s ok\n", test.name);
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
@@ -37287,6 +37876,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarSubvectorLoops(64));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
+  AddCase(ScalarZeroBitOps);
   AddCase(ScalarBitcmpB64DynamicOperands);
   AddCase(ScalarBitcmpB64IntegerConstants);
   AddCase(ScalarBrevB32PreservesScc);
@@ -37342,6 +37932,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
   cases.push_back(Vop2SdwaMaxI32CapturedHighWord(32));
   cases.push_back(Vop2SdwaMaxI32CapturedHighWord(64));
+  cases.push_back(Vop2SdwaMinI32CapturedByte0(32));
+  cases.push_back(Vop2SdwaMinI32CapturedByte0(64));
   cases.push_back(Vop2SdwaMulI24Destinations(32));
   cases.push_back(Vop2SdwaMulI24Destinations(64));
   cases.push_back(Vop2SdwaMulU24Destinations(32));
@@ -37399,9 +37991,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
   cases.push_back(VectorDpp8Captured(false));
-  cases.push_back(VectorDpp8Captured(true));
+  for (const u32 wave_size : {32u, 64u})
+    for (const bool fi : {false, true})
+      cases.push_back(VectorDpp8Captured(true, wave_size, fi));
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppRowXmask);
+  cases.push_back(VectorDppRowShare(32));
+  cases.push_back(VectorDppRowShare(64));
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
@@ -40459,14 +41055,13 @@ void CheckStorageTextureLinearUploadLayout() {
   TileSizeAlign total{};
   TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
   const auto layout =
-      TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size,
-                              false, "StorageTextureLinearTest");
-  const auto regions = TextureBuildImageCopies(layout);
+      MakeTilingImage(format, width, height, 1, depth, tile, total.size, false);
+  const auto regions = layout.BufferCopies();
   Require("StorageTextureLinearUpload", "layout",
           pitch == width && total.size == 0x1fa4000 && total.align == 256 &&
-              layout.surface.description.tile_mode == tile &&
-              layout.pitch == width && layout.slice_stride == total.size &&
-              regions.size() == 1 && regions[0].bufferOffset == 0 &&
+              layout.tile_mode == tile && layout.pitch == width &&
+              layout.linear_slice_stride == total.size && regions.size() == 1 &&
+              regions[0].bufferOffset == 0 &&
               regions[0].imageExtent.width == width &&
               regions[0].imageExtent.height == height &&
               regions[0].bufferRowLength == width,
@@ -40488,22 +41083,20 @@ void CheckStorageTextureDepthTileUploadLayout() {
   TileGetTextureSize(format, width, height, 1, tile, &slice, &level, &padded);
   TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
   const auto layout =
-      TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size,
-                              false, "StorageTextureDepthTileTest");
-  const auto regions = TextureBuildImageCopies(layout);
+      MakeTilingImage(format, width, height, 1, depth, tile, total.size, false);
+  const auto regions = layout.BufferCopies();
   Require("StorageTextureDepthTileUpload", "PPSA14053 layout",
           pitch == 256 && padded.width == 256 && padded.height == 256 &&
               slice.size == 0x10000 && slice.align == 0x10000 &&
               level.size == slice.size && level.offset == 0 &&
               total.size == slice.size && total.align == slice.align &&
-              layout.surface.description.tile_mode == tile &&
-              layout.surface.texture.block.family ==
-                  TileBlockFamily::Depth64KB &&
-              layout.pitch == pitch && layout.slice_stride == pitch &&
-              layout.source_slice_stride == total.size &&
-              layout.mips[0].size == pitch &&
-              layout.surface.mips[0].size == total.size &&
-              regions.size() == 1 && regions[0].bufferOffset == 0 &&
+              layout.tile_mode == tile &&
+              layout.tiling.block.family == TileBlockFamily::Depth64KB &&
+              layout.pitch == pitch && layout.linear_slice_stride == 0 &&
+              layout.tiled_slice_stride == total.size &&
+              layout.mip_layout[0].linear_size == pitch &&
+              layout.mip_layout[0].size == total.size && regions.size() == 1 &&
+              regions[0].bufferOffset == 0 &&
               regions[0].imageExtent.width == width &&
               regions[0].imageExtent.height == height &&
               regions[0].bufferRowLength == pitch,
@@ -40986,27 +41579,29 @@ void CheckStorageTextureVolumeUploadLayout() {
   TileSizeAlign total{};
   TileGetTextureTotalSize(format, width, height, depth, 1,
                           Prospero::TileMode::kRenderTarget, true, total);
-  const auto layout = TextureCalcUploadLayout(
-      format, width, height, 1, depth, Prospero::TileMode::kRenderTarget,
-      total.size, true, "StorageTextureVolumeTest");
-  const auto regions = TextureBuildImageCopies(layout);
-  Require(
-      "StorageTextureVolumeUpload", "layout",
-      pitch == 128 && total.size == 0x210000 && layout.slice_stride == 0x2208 &&
-          layout.source_slice_stride == 0 && layout.mips[0].size == 0x2208 &&
-          layout.surface.mips[0].size == 0x10000 && regions.size() == depth,
-      "3D render-target upload did not preserve its compact linear layout");
+  const auto layout =
+      MakeTilingImage(format, width, height, 1, depth,
+                      Prospero::TileMode::kRenderTarget, total.size, true);
+  const auto regions = layout.BufferCopies();
+  Require("StorageTextureVolumeUpload", "layout",
+          pitch == 128 && total.size == 0x210000 &&
+              layout.linear_slice_stride == 0 &&
+              layout.tiled_slice_stride == 0x10000 &&
+              layout.mip_layout[0].linear_size == 0x2208 &&
+              layout.mip_layout[0].size == 0x10000 && regions.size() == 1 &&
+              regions[0].imageExtent.depth == depth,
+          "3D render-target upload did not preserve its compact linear layout");
 
-  std::vector<GpuTileInfo> infos;
   Require("StorageTextureVolumeUpload", "GPU records",
-          TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos) &&
-              infos.size() == depth,
-          "3D render-target GPU records were not built");
+          layout.resources.levels == 1 && layout.MipExtent(0).depth == depth,
+          "3D render-target canonical mip record lost its depth");
   for (const uint32_t z : {0u, 1u, depth - 1u}) {
+    const auto &mip = layout.mip_layout[0];
     Require("StorageTextureVolumeUpload", "slice offsets",
-            infos[z].linear_offset == static_cast<uint64_t>(z) * 0x2208 &&
-                infos[z].tiled_offset == static_cast<uint64_t>(z) * 0x10000 &&
-                infos[z].surface_z == z && infos[z].pitch == width,
+            mip.linear_offset + z * mip.linear_size == uint64_t{z} * 0x2208 &&
+                mip.offset + z * layout.tiled_slice_stride ==
+                    uint64_t{z} * 0x10000 &&
+                mip.surface_z + z == z && mip.linear_pitch == width,
             "volume slice lost its linear stride, block slice, or Z swizzle");
   }
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeUpload");
@@ -41022,30 +41617,34 @@ void CheckStorageTextureVolumeMipRegions() {
   TileSizeAlign total{};
   TileGetTextureTotalSize(format, width, height, depth, levels, tile, true,
                           total);
-  const auto layout = TextureCalcUploadLayout(
-      format, width, height, levels, depth, tile, total.size, true,
-      "StorageTextureVolumeMipTest");
-  const auto copies = TextureBuildImageCopies(layout);
+  const auto layout = MakeTilingImage(format, width, height, levels, depth,
+                                      tile, total.size, true);
+  const auto copies = layout.BufferCopies();
 
-  bool valid = copies.size() == 8;
-  size_t index = 0;
-  for (uint32_t level = 0; level < levels && valid; level++) {
-    const uint32_t mip_depth = std::max(depth >> level, 1u);
-    const uint32_t mip_width = std::max(width >> level, 1u);
-    const uint32_t mip_height = std::max(height >> level, 1u);
-    for (uint32_t z = 0; z < mip_depth; z++, index++) {
-      const auto &copy = copies[index];
-      valid &= copy.imageSubresource.mipLevel == level &&
-               copy.imageOffset.z == static_cast<int>(z) &&
-               copy.imageExtent.width == mip_width &&
-               copy.imageExtent.height == mip_height &&
-               copy.bufferOffset ==
-                   layout.mips[level].offset + z * layout.slice_stride &&
-               copy.bufferRowLength == layout.mips[level].row_length &&
-               copy.bufferImageHeight == layout.mips[level].image_height;
-    }
+  bool valid = copies.size() == levels;
+  for (uint32_t level = 0; level < levels && valid; ++level) {
+    const auto &copy = copies[level];
+    const auto &mip = layout.mip_layout[level];
+    const auto active = layout.MipExtent(level);
+    valid &= copy.imageSubresource.mipLevel == level &&
+             copy.imageOffset.z == 0 &&
+             copy.imageExtent.width == active.width &&
+             copy.imageExtent.height == active.height &&
+             copy.imageExtent.depth == active.depth &&
+             copy.bufferOffset == mip.linear_offset &&
+             copy.bufferRowLength == mip.linear_pitch &&
+             uint64_t{copy.bufferRowLength} * copy.bufferImageHeight *
+                     sizeof(uint32_t) ==
+                 layout.linear_slice_stride;
   }
-  valid &= index == copies.size();
+  const auto saved_mips = layout.mip_layout;
+  const auto prefix = layout.BufferCopies(1024, 1);
+  const auto again = layout.BufferCopies();
+  valid &= prefix.size() == 1 &&
+           prefix[0].bufferOffset == 1024 + layout.mip_layout[0].linear_offset &&
+           copies[0].bufferOffset == 768 && copies[1].bufferOffset == 256 &&
+           copies[2].bufferOffset == 0 && again == copies &&
+           layout.mip_layout == saved_mips;
   Require("StorageTextureVolumeMipRegions", "per-mip depth", valid,
           "direction-neutral image copies did not shrink depth or preserve "
           "Vulkan Z coordinates");
@@ -42486,6 +43085,53 @@ void CheckShaderFusion() {
   std::printf("[host]    %-32s ok\n", "ShaderFusion");
 }
 
+void CheckAgcSystemTable(RenderContext &renderer) {
+  constexpr const char *name = "AgcSystemTable";
+  constexpr uint64_t driver_base = 0x0fe0000000ull;
+  constexpr uint64_t table_address = driver_base + 0x40000;
+  constexpr std::array<uint32_t, 16> native_validator{
+      0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a,
+      0xbf800000, 0x8590807e, 0xb96a0a18, 0xbf066a80,
+      0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
+      0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e};
+  LibKernel::Memory::InstallGpuResources(&renderer);
+  uint32_t state = 0xabcdef01u;
+  Require(name, "driver startup", Gen5::AgcInit(&state, 13) == 0 && state == 0xabcdef01u,
+          "Agc startup failed or changed its ignored public state pointer");
+  LibKernel::Memory::VirtualQueryInfo mapping{};
+  Require(name, "shared driver backing",
+          LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void *>(driver_base), 0,
+                                                 &mapping, sizeof(mapping)) == 0 &&
+              mapping.start == driver_base && mapping.end == driver_base + 0x200000 &&
+              mapping.memory_type == 12 && mapping.protection == 0x33 && mapping.is_direct &&
+              std::strcmp(mapping.name, "SceAgcDriver") == 0 &&
+              renderer.IsMapped(driver_base, 0x200000),
+          "driver startup bypassed shared DMEM metadata or GPU range registration");
+  ShaderBufferResource descriptor{};
+  std::array<uint64_t, 16> functions{};
+  std::array<uint32_t, 16> code{};
+  Require(name, "ordered-count function backing",
+          LibKernel::Memory::TryReadBacking(table_address, &descriptor, sizeof(descriptor)) &&
+              descriptor.Base48() == table_address + 0x60 && descriptor.Stride() == 16 &&
+              descriptor.NumRecords() == 8 && descriptor.fields[3] == 0x5204 &&
+              LibKernel::Memory::TryReadBacking(descriptor.Base48(), functions.data(),
+                                                 sizeof(functions)) &&
+              functions[4] != 0 && (functions[4] & 0xffu) == 0 && functions[5] == 0 &&
+              LibKernel::Memory::TryReadBacking(functions[4], code.data(), sizeof(code)) &&
+              code == native_validator,
+          "system descriptor did not reach the queue validator and its user data");
+  auto *instrumentation = reinterpret_cast<uint64_t *>(table_address + 0x18);
+  Require(name, "default instrumentation", *instrumentation == 0,
+          "unused vertex validation was enabled at startup");
+  *instrumentation = 0x12340000u;
+  Require(name, "repeat startup", Gen5::AgcInit(nullptr, 13) == 0 &&
+              *instrumentation == 0x12340000u,
+          "repeat Agc initialization reset existing system state");
+  *instrumentation = 0;
+  LibKernel::Memory::InstallGpuResources(nullptr);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct CommandBufferLayout {
   using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
                                           void *);
@@ -43422,11 +44068,19 @@ int main(int argc, char **argv) {
     vulkan.CheckNativeIndirectDispatch();
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--integer64-compare-only") == 0) {
+  if (argc == 2 && (std::strcmp(argv[1], "--integer64-compare-only") == 0 ||
+                    std::strcmp(argv[1], "--cmp-i64-only") == 0)) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorCompareInteger64Edges());
     RunCase(&vulkan, VectorCompareExecWaveMasks(32));
     RunCase(&vulkan, VectorCompareExecWaveMasks(64));
+    RunCase(&vulkan, VectorCompare64WaveMasks(32, true));
+    RunCase(&vulkan, VectorCompare64WaveMasks(64, true));
+    RunCase(&vulkan, VectorVop3CompareEqI64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareEqU64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareGtU64OnGpu());
+    RunCase(&vulkan, VectorVopcCompareLtU64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareNeU64OnGpu());
     RunCase(&vulkan, VectorVopcCmpxNeU64CapturedExecMask());
     RunCase(&vulkan, VectorVop3CmpxNeI64CapturedExecMask());
     return 0;
@@ -43467,9 +44121,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorDpp8Captured(false));
-    RunCase(&vulkan, VectorDpp8Captured(true));
+    for (const u32 wave_size : {32u, 64u})
+      for (const bool fi : {false, true})
+        RunCase(&vulkan, VectorDpp8Captured(true, wave_size, fi));
     RunCase(&vulkan, VectorDppQuadPermuteReverse());
     RunCase(&vulkan, VectorDppRowXmask());
+    RunCase(&vulkan, VectorDppRowShare(32));
+    RunCase(&vulkan, VectorDppRowShare(64));
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
     return 0;
@@ -43495,6 +44153,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompareI16U16Ops());
     RunCase(&vulkan, Vop3Int16Ops());
     RunCase(&vulkan, Vop3pInt16Ops());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-zero-bit-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarZeroBitOps());
+    RunCase(&vulkan, ScalarBitfieldPack());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-format-store-only") == 0) {
@@ -43908,6 +44572,13 @@ int main(int argc, char **argv) {
     vulkan.CheckStreamBufferRing();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-layout-only") == 0) {
+    CheckStorageTextureLinearUploadLayout();
+    CheckStorageTextureDepthTileUploadLayout();
+    CheckStorageTextureVolumeUploadLayout();
+    CheckStorageTextureVolumeMipRegions();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
@@ -43916,6 +44587,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
+    vulkan.CheckScalarLeafCall();
+    CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
@@ -44222,6 +44895,7 @@ int main(int argc, char **argv) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     CheckIndirectImageKeySwitch(vulkan);
+    CheckFiniteInlineSamplerPhi(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
@@ -44368,6 +45042,7 @@ int main(int argc, char **argv) {
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
   CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
   CheckShaderFusion();
+  CheckAgcSystemTable(vulkan.RuntimeRenderer());
   CheckPm4WaitPackets(vulkan.RuntimeRenderer());
   CheckPm4DrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
@@ -44384,6 +45059,7 @@ int main(int argc, char **argv) {
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
+  CheckFiniteInlineSamplerPhi(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
@@ -44437,6 +45113,7 @@ int main(int argc, char **argv) {
   }
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
+  vulkan.CheckScalarLeafCall();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

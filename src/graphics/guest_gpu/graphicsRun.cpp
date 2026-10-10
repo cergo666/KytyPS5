@@ -1208,14 +1208,15 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		auto& executor = m_renderer.GetRenderExecutor();
-		if (executor.TryDeferDispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
-		                                    thread_group_y, thread_group_z, mode)) {
+		const bool async_compute = IsAsyncComputeQueue();
+		if (!async_compute && executor.TryDeferDispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+		                                                      thread_group_y, thread_group_z, mode)) {
 			return;
 		}
 		// Runs now, so every earlier deferred operation must execute first.
 		executor.FlushDeferredDraws();
 		executor.DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x, thread_group_y,
-		                        thread_group_z, mode);
+		                        thread_group_z, mode, async_compute);
 	}
 }
 
@@ -1227,7 +1228,8 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
+	                                                IsAsyncComputeQueue());
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
