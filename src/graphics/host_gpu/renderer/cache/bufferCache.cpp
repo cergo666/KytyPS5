@@ -34,7 +34,12 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 // Pages published with a page-sized download, on each side of it.
-constexpr uint64_t DownloadNeighbourhood = 256 * 1024;
+// Finished dirty pages around a read-fault are published together with it; KYTY_DL_NEIGHBOUR_KB
+// changes the reach on each side (default 256 KiB).
+static const uint64_t DownloadNeighbourhood = [] {
+	const char* env = std::getenv("KYTY_DL_NEIGHBOUR_KB");
+	return (env != nullptr ? std::strtoull(env, nullptr, 10) : 256ull) * 1024ull;
+}();
 
 void ReadUploadMemory(uint64_t address, void* destination, uint64_t size) {
 	// Buffer descriptors and page-aligned upload ranges may include reserved pages.
@@ -155,6 +160,11 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
 	}
+	if (!m_async_pending.empty()) {
+		// A queued readback copy still reads this buffer.
+		const auto& doomed = m_slot_buffers[id];
+		FlushAsyncReadbacks(doomed.CpuAddress(), doomed.CpuAddress() + doomed.Size());
+	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -178,7 +188,8 @@ static bool ReadbackDiagEnabled() {
 /// buffer as a conservative hazard covering all packed copies. Synchronous publication
 /// waits for the GPU and earlier priority callbacks before writing guest backing.
 template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       std::binary_semaphore* waiter, bool* deferred) {
 	KYTY_WAIT_SCOPE(async ? "download.async" : "download.sync");
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
@@ -197,6 +208,15 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size, gather);
 	if (copies.empty()) {
 		return false;
+	}
+	if (!m_async_pending.empty()) {
+		// Bytes dirtied again while an older readback of them is in flight: that one publishes first.
+		uint64_t low = UINT64_MAX, high = 0;
+		for (const auto& copy: copies) {
+			low  = std::min(low, buffer_address + copy.srcOffset);
+			high = std::max(high, buffer_address + copy.srcOffset + copy.size);
+		}
+		FlushAsyncReadbacks(low, high);
 	}
 	const auto readback_begin = std::chrono::steady_clock::now();
 	// The newest submitted tick that wrote these bytes: recorded GPU writes (finished ones are
@@ -260,6 +280,14 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	}
 
+	if constexpr (!async) {
+		if (waiter != nullptr && detached && m_scheduler.HasReadbackQueue() &&
+		    TryStartAsyncReadback(buffer, vaddr, size, buffer_address, copies, total_size,
+		                          writer_tick, neighbours, waiter)) {
+			*deferred = true;
+			return true;
+		}
+	}
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
@@ -518,6 +546,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	DrainAsyncReadbacks();
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -534,6 +563,9 @@ BufferCache::~BufferCache() {
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
+	}
+	if (!m_async_pending.empty()) {
+		FlushAsyncReadbacks(vaddr, vaddr + size);
 	}
 	EraseKnownFills(vaddr, size);
 	{
@@ -733,6 +765,340 @@ bool BufferCache::TryResolveKnownFill(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+struct BufferCache::AsyncReadback {
+	std::vector<vk::BufferCopy>                copies;
+	uint64_t                                   buffer_address = 0;
+	uint64_t                                   staging_offset = 0;
+	uint64_t                                   total_size     = 0;
+	uint64_t                                   tick           = 0;
+	std::vector<GuestRange>                    published;
+	std::vector<std::pair<uint64_t, uint64_t>> release;  // [begin, end) handed back at the end
+	std::vector<std::pair<uint64_t, uint64_t>> inflight; // bytes added to m_inflight_ranges
+	size_t                                     slot = 0;
+	std::vector<std::binary_semaphore*>        waiters;
+	std::atomic<bool>                          published_flag {false};
+	bool                                       finalized = false;
+};
+
+bool BufferCache::AsyncReadbackEnabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_NO_ASYNC_READBACK");
+		return env == nullptr || env[0] != '1';
+	}();
+	return enabled;
+}
+
+bool BufferCache::TryStartAsyncReadback(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                        uint64_t buffer_address, std::vector<vk::BufferCopy>& copies,
+                                        uint64_t total_size, uint64_t writer_tick,
+                                        const std::vector<std::pair<uint64_t, uint64_t>>& neighbours,
+                                        std::binary_semaphore* waiter) {
+	if (!AsyncReadbackEnabled() || total_size > kAsyncSlotBytes) {
+		return false;
+	}
+	auto& device = m_graphics.device;
+	if (!m_async_ready) {
+		m_async_staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                           vk::BufferUsageFlagBits::eTransferDst,
+		                                           kAsyncSlots * kAsyncSlotBytes);
+		for (auto& slot: m_async_slots) {
+			vk::CommandPoolCreateInfo pool {};
+			pool.queueFamilyIndex = m_graphics.queue_family;
+			pool.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+			             vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+			EXIT_NOT_IMPLEMENTED(device.createCommandPool(&pool, nullptr, &slot.pool) !=
+			                     vk::Result::eSuccess);
+			vk::CommandBufferAllocateInfo allocate {};
+			allocate.commandPool        = slot.pool;
+			allocate.level              = vk::CommandBufferLevel::ePrimary;
+			allocate.commandBufferCount = 1;
+			EXIT_NOT_IMPLEMENTED(device.allocateCommandBuffers(&allocate, &slot.cmd) !=
+			                     vk::Result::eSuccess);
+			vk::FenceCreateInfo fence {};
+			EXIT_NOT_IMPLEMENTED(device.createFence(&fence, nullptr, &slot.fence) !=
+			                     vk::Result::eSuccess);
+		}
+		m_async_thread = std::jthread([this](std::stop_token stop) { AsyncReadbackThread(stop); });
+		m_async_ready  = true;
+	}
+	size_t slot_index = kAsyncSlots;
+	{
+		std::lock_guard lock(m_async_mutex);
+		for (size_t i = 0; i < kAsyncSlots; ++i) {
+			if (!m_async_slots[i].busy) {
+				m_async_slots[i].busy = true;
+				slot_index            = i;
+				break;
+			}
+		}
+	}
+	if (slot_index == kAsyncSlots) {
+		return false;
+	}
+	auto readback            = std::make_shared<AsyncReadback>();
+	readback->slot           = slot_index;
+	readback->buffer_address = buffer_address;
+	readback->staging_offset = slot_index * kAsyncSlotBytes;
+	readback->total_size     = total_size;
+	readback->tick           = m_scheduler.CurrentTick();
+	readback->copies         = copies;
+	for (auto& copy: readback->copies) {
+		readback->published.push_back({buffer_address + copy.srcOffset, copy.size});
+		readback->inflight.emplace_back(buffer_address + copy.srcOffset,
+		                                buffer_address + copy.srcOffset + copy.size);
+		copy.dstOffset += readback->staging_offset;
+	}
+	readback->release.emplace_back(vaddr, vaddr + size);
+	for (const auto& [address, bytes]: neighbours) {
+		readback->release.emplace_back(address, address + bytes);
+	}
+
+	auto& slot = m_async_slots[slot_index];
+	// The copy is independent of the deferred Vulkan stream: record and submit it directly.
+	const bool                 deferral = CommandScheduler::SuspendRecorderDeferral();
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_NOT_IMPLEMENTED(slot.cmd.begin(&begin) != vk::Result::eSuccess);
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	slot.cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                         vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                         nullptr);
+	slot.cmd.copyBuffer(buffer.Handle(), m_async_staging->Handle(),
+	                    static_cast<uint32_t>(readback->copies.size()), readback->copies.data());
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = m_async_staging->Handle();
+	after.offset        = readback->staging_offset;
+	after.size          = total_size;
+	slot.cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                         vk::PipelineStageFlagBits::eAllCommands |
+	                             vk::PipelineStageFlagBits::eHost,
+	                         {}, 0, nullptr, 1, &after, 0, nullptr);
+	EXIT_NOT_IMPLEMENTED(slot.cmd.end() != vk::Result::eSuccess);
+
+	const uint64_t                  wait_value = writer_tick;
+	const auto                      semaphore  = m_scheduler.GetMasterSemaphore().Handle();
+	const vk::PipelineStageFlags    stage      = vk::PipelineStageFlagBits::eAllCommands;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &wait_value;
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext              = wait_value != 0 ? &timeline : nullptr;
+	submit_info.waitSemaphoreCount = wait_value != 0 ? 1u : 0u;
+	submit_info.pWaitSemaphores    = &semaphore;
+	submit_info.pWaitDstStageMask  = &stage;
+	submit_info.commandBufferCount = 1;
+	submit_info.pCommandBuffers    = &slot.cmd;
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.readback_queue_mutex);
+		result = m_graphics.readback_queue.submit(1, &submit_info, slot.fence);
+	}
+	CommandScheduler::ResumeRecorderDeferral(deferral);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	readback->waiters.push_back(waiter);
+	for (const auto& [begin_address, end_address]: readback->inflight) {
+		m_inflight_ranges.Add(begin_address, end_address - begin_address);
+	}
+	{
+		std::lock_guard lock(m_async_mutex);
+		m_async_pending.push_back(std::move(readback));
+	}
+	m_async_cv.notify_all();
+	return true;
+}
+
+bool BufferCache::JoinAsyncReadback(uint64_t vaddr, uint64_t size, std::binary_semaphore* waiter) {
+	if (m_async_pending.empty()) {
+		return false;
+	}
+	const auto overlaps = [&](uint64_t begin, uint64_t end) {
+		return begin < vaddr + size && vaddr < end;
+	};
+	std::lock_guard lock(m_async_mutex);
+	for (auto& readback: m_async_pending) {
+		if (readback->finalized) {
+			continue;
+		}
+		for (const auto& [begin, end]: readback->release) {
+			if (overlaps(begin, end)) {
+				readback->waiters.push_back(waiter);
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void BufferCache::FlushAsyncReadbacks(uint64_t begin, uint64_t end) {
+	std::vector<std::shared_ptr<AsyncReadback>> hits;
+	{
+		std::lock_guard lock(m_async_mutex);
+		for (auto& readback: m_async_pending) {
+			if (readback->finalized) {
+				continue;
+			}
+			const auto hit = [&](const auto& ranges) {
+				return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+					return range.first < end && begin < range.second;
+				});
+			};
+			if (hit(readback->release) || hit(readback->inflight)) {
+				hits.push_back(readback);
+			}
+		}
+	}
+	for (const auto& readback: hits) {
+		{
+			std::unique_lock lock(m_async_mutex);
+			m_async_cv.wait(lock, [&] { return readback->published_flag.load(); });
+		}
+		FinalizeAsyncReadback(readback);
+	}
+}
+
+void BufferCache::ReleaseNotRedirtied(uint64_t begin, uint64_t end) {
+	// Pages the GPU dirtied again since the snapshot stay protected; the rest become readable.
+	const auto first = Common::AlignDown(begin, TRACKER_PAGE_SIZE);
+	const auto last  = Common::AlignUp(end, TRACKER_PAGE_SIZE);
+	uint64_t   run   = 0;
+	bool       open  = false;
+	const auto flush = [&](uint64_t run_end) {
+		if (open && m_scheduler.Context().IsMapped(run, run_end - run)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(run, run_end - run);
+		}
+		open = false;
+	};
+	for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
+		if (m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			flush(page);
+		} else if (!open) {
+			run  = page;
+			open = true;
+		}
+	}
+	flush(last);
+}
+
+void BufferCache::FinalizeAsyncReadback(const std::shared_ptr<AsyncReadback>& readback) {
+	std::vector<std::binary_semaphore*> waiters;
+	{
+		std::lock_guard lock(m_async_mutex);
+		if (readback->finalized) {
+			return;
+		}
+		readback->finalized = true;
+		std::erase(m_async_pending, readback);
+		waiters = std::move(readback->waiters);
+	}
+	for (const auto& [begin, end]: readback->inflight) {
+		m_inflight_ranges.Subtract(begin, end - begin);
+	}
+	for (const auto& [begin, end]: readback->release) {
+		ReleaseNotRedirtied(begin, end);
+	}
+	for (auto* waiter: waiters) {
+		waiter->release();
+	}
+}
+
+void BufferCache::PublishAsyncReadback(AsyncReadback& readback) {
+	// Older publications of the same bytes go first; unrelated ones need not be waited for.
+	m_scheduler.WaitPriorityOperations(readback.tick > 0 ? readback.tick - 1 : 0,
+	                                   readback.published);
+	m_async_staging->Invalidate(readback.staging_offset, readback.total_size);
+	const auto* mapped = m_async_staging->Mapped().data();
+	for (const auto& copy: readback.copies) {
+		Libs::LibKernel::Memory::WriteBacking(readback.buffer_address + copy.srcOffset,
+		                                      mapped + copy.dstOffset, copy.size);
+	}
+	auto& slot = m_async_slots[readback.slot];
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.resetFences(1, &slot.fence) != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(slot.cmd.reset({}) != vk::Result::eSuccess);
+	{
+		std::lock_guard lock(m_async_mutex);
+		slot.busy = false;
+		readback.published_flag.store(true);
+	}
+	m_async_cv.notify_all();
+}
+
+void BufferCache::AsyncReadbackThread(std::stop_token stop) {
+	auto& device = m_graphics.device;
+	while (!stop.stop_requested()) {
+		std::shared_ptr<AsyncReadback> readback;
+		{
+			std::unique_lock lock(m_async_mutex);
+			m_async_cv.wait_for(lock, std::chrono::milliseconds(50), [&] {
+				return std::any_of(m_async_pending.begin(), m_async_pending.end(),
+				                   [](const auto& r) { return !r->published_flag.load(); });
+			});
+			for (auto& candidate: m_async_pending) {
+				if (!candidate->published_flag.load()) {
+					readback = candidate;
+					break;
+				}
+			}
+		}
+		if (readback == nullptr) {
+			continue;
+		}
+		auto&      slot = m_async_slots[readback->slot];
+		vk::Result wait = vk::Result::eTimeout;
+		while (wait == vk::Result::eTimeout && !stop.stop_requested()) {
+			wait = device.waitForFences(1, &slot.fence, VK_TRUE, 50'000'000);
+		}
+		if (wait != vk::Result::eSuccess) {
+			continue; // stopping; DrainAsyncReadbacks finishes the work
+		}
+		PublishAsyncReadback(*readback);
+		// Page release and the waiting threads' wake-up belong to the GPU thread.
+		auto& gpu = m_scheduler.Context().GetGpu();
+		if (!gpu.IsStopping()) {
+			gpu.SendCommand([this, readback] { FinalizeAsyncReadback(readback); }, false);
+		}
+	}
+}
+
+void BufferCache::DrainAsyncReadbacks() {
+	if (!m_async_ready) {
+		return;
+	}
+	m_async_thread.request_stop();
+	m_async_cv.notify_all();
+	if (m_async_thread.joinable()) {
+		m_async_thread.join();
+	}
+	std::vector<std::shared_ptr<AsyncReadback>> rest;
+	{
+		std::lock_guard lock(m_async_mutex);
+		rest.assign(m_async_pending.begin(), m_async_pending.end());
+	}
+	for (const auto& readback: rest) {
+		if (!readback->published_flag.load()) {
+			auto& slot = m_async_slots[readback->slot];
+			(void)m_graphics.device.waitForFences(1, &slot.fence, VK_TRUE, UINT64_MAX);
+			PublishAsyncReadback(*readback);
+		}
+		FinalizeAsyncReadback(readback);
+	}
+	for (auto& slot: m_async_slots) {
+		m_graphics.device.destroyFence(slot.fence, nullptr);
+		m_graphics.device.destroyCommandPool(slot.pool, nullptr);
+	}
+	m_async_staging.reset();
+	m_async_ready = false;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_BLOCK("Buf::ReadMemory");
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -747,7 +1113,33 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		return env != nullptr && env[0] == '1';
 	}();
 	const bool ordered = is_write || fault_flush;
+	if (!is_write && !ordered && !GuestGpu::IsGpuThread() && AsyncReadbackEnabled()) {
+		// The command processor submits the copy and moves on; the page is released, and this
+		// thread resumed, once the data has been published to guest memory.
+		std::binary_semaphore done {0};
+		m_scheduler.Context().GetGpu().SendCommand([this, vaddr, size, &done]() mutable {
+			KYTY_WAIT_SCOPE("readmem.cp.fault");
+			if (JoinAsyncReadback(vaddr, size, &done)) {
+				return;
+			}
+			auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+			std::tie(vaddr, size) = FaultAround(buffer, vaddr, size);
+			bool deferred = false;
+			if (DownloadBufferMemory<false>(buffer, vaddr, size, &done, &deferred) && !deferred) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			}
+			if (!deferred) {
+				done.release();
+			}
+		}, false);
+		done.acquire();
+		return;
+	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write]() mutable {
+		if (!m_async_pending.empty()) {
+			FlushAsyncReadbacks(vaddr, vaddr + size);
+		}
+		KYTY_WAIT_SCOPE(is_write ? "readmem.cp.write" : "readmem.cp.fault");
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -1101,7 +1493,8 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	       (!m_inflight_ranges.Empty() && m_inflight_ranges.Intersects(vaddr, size));
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -1150,6 +1543,9 @@ void BufferCache::RunGarbageCollector() {
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (!m_async_pending.empty()) {
+			FlushAsyncReadbacks(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size());
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
