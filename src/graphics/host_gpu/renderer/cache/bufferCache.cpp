@@ -7,6 +7,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/perfLog.h"
 #include "graphics/host_gpu/cpWaitStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -1033,6 +1034,7 @@ void BufferCache::PublishAsyncReadback(AsyncReadback& readback) {
 }
 
 void BufferCache::AsyncReadbackThread(std::stop_token stop) {
+	Libs::Graphics::PerfLog::RegisterThisThread("readback");
 	auto& device = m_graphics.device;
 	while (!stop.stop_requested()) {
 		std::shared_ptr<AsyncReadback> readback;

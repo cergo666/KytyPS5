@@ -1,3 +1,4 @@
+#include "graphics/hostCores.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/cpSampler.h"
 #include "graphics/perfLog.h"
@@ -470,6 +471,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_state  = gpu;
 	CpSamplerStartIfEnabled();
 	PerfLog::RegisterThisThread("cp");
+	HostCores::PinCurrentThread(0);
 	VkRecorder::EnableForThisThread();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// This thread alone turns the guest's command buffers into GPU work; keep it above the game's

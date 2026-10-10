@@ -40,8 +40,8 @@ struct SymbolInfo {
 
 class Sampler {
 public:
-	explicit Sampler(HANDLE thread, double window_seconds)
-	    : m_thread(thread), m_window_seconds(window_seconds) {
+	explicit Sampler(HANDLE thread, double window_seconds, const char* prefix)
+	    : m_thread(thread), m_window_seconds(window_seconds), m_prefix(prefix) {
 		m_samples.reserve(40000);
 	}
 
@@ -190,7 +190,7 @@ private:
 			}
 		}
 		char name[64];
-		std::snprintf(name, sizeof(name), "cp_samples_%u.txt", m_report_index++);
+		std::snprintf(name, sizeof(name), "%s_%u.txt", m_prefix.c_str(), m_report_index++);
 		FILE* out = std::fopen(name, "w");
 		if (out == nullptr) {
 			return;
@@ -210,6 +210,7 @@ private:
 
 	HANDLE                                m_thread;
 	double                                m_window_seconds;
+	std::string                           m_prefix;
 	std::vector<Sample>                   m_samples;
 	std::unordered_map<uint64_t, SymbolInfo> m_cache;
 	std::unordered_map<uint64_t, std::string> m_modules;
@@ -219,7 +220,11 @@ private:
 } // namespace
 
 void CpSamplerStartIfEnabled() {
-	const char* enabled = std::getenv("KYTY_CP_SAMPLE");
+	CpSamplerStartIfEnabled("KYTY_CP_SAMPLE", "cp_samples");
+}
+
+void CpSamplerStartIfEnabled(const char* env_name, const char* file_prefix) {
+	const char* enabled = std::getenv(env_name);
 	if (enabled == nullptr || enabled[0] != '1') {
 		return;
 	}
@@ -233,7 +238,7 @@ void CpSamplerStartIfEnabled() {
 	if (const char* env = std::getenv("KYTY_CP_SAMPLE_WINDOW"); env != nullptr) {
 		window = (std::max)(2.0, std::atof(env));
 	}
-	auto* sampler = new Sampler(self, window); // lives until the process exits
+	auto* sampler = new Sampler(self, window, file_prefix); // lives until the process exits
 	std::thread([sampler] { sampler->Run(); }).detach();
 }
 
@@ -243,6 +248,7 @@ void CpSamplerStartIfEnabled() {
 
 namespace Libs::Graphics {
 void CpSamplerStartIfEnabled() {}
+void CpSamplerStartIfEnabled(const char*, const char*) {}
 } // namespace Libs::Graphics
 
 #endif

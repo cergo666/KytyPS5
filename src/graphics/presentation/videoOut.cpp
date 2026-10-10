@@ -1,3 +1,4 @@
+#include "graphics/perfLog.h"
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -850,6 +851,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	Libs::Graphics::PerfLog::RegisterThisThread("present");
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 

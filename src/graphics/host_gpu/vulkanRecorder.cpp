@@ -1,3 +1,6 @@
+#include "graphics/hostCores.h"
+#include "graphics/guest_gpu/cpSampler.h"
+#include "graphics/perfLog.h"
 #include "graphics/host_gpu/vulkanRecorder.h"
 
 #include "common/assert.h"
@@ -247,6 +250,9 @@ void Emit(ReplayFn fn, F&& serialize) {
 }
 
 void RecorderThread() {
+	Libs::Graphics::PerfLog::RegisterThisThread("recorder");
+	Libs::Graphics::HostCores::PinCurrentThread(1);
+	CpSamplerStartIfEnabled("KYTY_REC_SAMPLE", "rec_samples");
 #if defined(_WIN32)
 	// Same rank as the GPU thread that feeds it.
 	if (const char* env = std::getenv("KYTY_PRIO_BANDS"); env == nullptr || env[0] != '0') {

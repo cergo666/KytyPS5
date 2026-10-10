@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_ASYNCMATERIALIZE_H_
 
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/perfLog.h"
 #include "kernel/memory.h"
 
 #include <array>
@@ -212,6 +213,7 @@ private:
 	}
 
 	static void Run(Lane& lane, std::stop_token stop) {
+		Libs::Graphics::PerfLog::RegisterThisThread("lane");
 		// Spin iterations before a lane sleeps (KYTY_ASYNC_SPIN). Longer spinning was measured to burn
 		// CPU without making frames faster.
 		static const uint32_t spin_limit = [] {
