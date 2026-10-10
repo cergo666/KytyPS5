@@ -21,7 +21,7 @@ struct FormatInfo {
 constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k8UNorm, 1, 0, 1, true, false},
 	{BufferFormat::k8UScaled, 1, 0, 0, true, false},
-	{BufferFormat::k8SNorm, 1, 0, 1, false, false},
+	{BufferFormat::k8SNorm, 1, 0, 1, true, false},
 	{BufferFormat::k8UInt, 1, 0, 1, true, true},
 	{BufferFormat::k16UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16SNorm, 2, 0, 2, true, false},
