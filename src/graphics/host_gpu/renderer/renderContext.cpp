@@ -10,8 +10,65 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
+#include <map>
+#include <mutex>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace Libs::Graphics {
+
+#if defined(_WIN32)
+// KYTY_DIAG_FAULT=1: groups guest read faults by call stack and prints the costliest ones.
+// Addresses are exe-relative; resolve them with llvm-symbolizer against kyty_emulator.pdb.
+static void DiagFaultRead(uint64_t ns, uint64_t addr) {
+	struct Entry {
+		uint64_t count = 0, ns = 0, first_addr = 0;
+		void*    frames[14] {};
+		DWORD    thread = 0;
+	};
+	static std::mutex                 mutex;
+	static std::map<uint64_t, Entry>  entries;
+	static auto                       last = std::chrono::steady_clock::now();
+	void*                             frames[14] {};
+	const auto count = RtlCaptureStackBackTrace(2, 14, frames, nullptr);
+	uint64_t   hash  = 1469598103934665603ull;
+	for (unsigned i = 0; i < count; ++i) {
+		hash = (hash ^ reinterpret_cast<uint64_t>(frames[i])) * 1099511628211ull;
+	}
+	std::lock_guard lock(mutex);
+	auto& e = entries[hash];
+	if (e.count == 0) {
+		std::copy(frames, frames + 14, e.frames);
+		e.first_addr = addr;
+		e.thread     = GetCurrentThreadId();
+	}
+	e.count++;
+	e.ns += ns;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(30)) {
+		return;
+	}
+	last = now;
+	std::vector<std::pair<uint64_t, const Entry*>> sorted;
+	for (const auto& [h, v]: entries) sorted.emplace_back(v.ns, &v);
+	std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.first > b.first; });
+	const auto base = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+	std::printf("FAULTDIAG ---- top read-fault stacks\n");
+	for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+		const auto& v = *sorted[i].second;
+		std::printf("FAULTDIAG n=%llu total_ms=%.1f thread=%lu addr=0x%llx:", static_cast<unsigned long long>(v.count),
+		            static_cast<double>(v.ns) / 1e6, static_cast<unsigned long>(v.thread),
+		            static_cast<unsigned long long>(v.first_addr));
+		for (auto* f: v.frames) {
+			if (f != nullptr) std::printf(" 0x%llx", static_cast<unsigned long long>(reinterpret_cast<uint64_t>(f) - base));
+		}
+		std::printf("\n");
+	}
+	std::fflush(stdout);
+}
+#endif
 
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
@@ -73,6 +130,16 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		KYTY_PROFILER_BLOCK("Ctx::FaultRead");
+#if defined(_WIN32)
+		static const bool diag = std::getenv("KYTY_DIAG_FAULT") != nullptr;
+		if (diag) {
+			const auto t0 = std::chrono::steady_clock::now();
+			m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+			DiagFaultRead(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                  std::chrono::steady_clock::now() - t0).count()), fault_vaddr);
+			return true;
+		}
+#endif
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
