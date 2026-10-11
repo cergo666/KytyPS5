@@ -11838,6 +11838,78 @@ public:
       context.ShutdownGpu();
       LibKernel::Memory::InstallGpuResources(nullptr);
     }
+    {
+      // PPSA01593 samples a DCC R32 color surface through a comparison sampler.
+      constexpr uint64_t comparison_dcc = base + 0x10000;
+      std::memset(mapped, 0, 0x10000);
+      std::memset(reinterpret_cast<void *>(comparison_dcc), 0xff, 0x1000);
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      const ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+          0xc1600000u, 0x000fc00fu, 0x91b00204u, 0, 0x00700000u,
+          0x002b0000u | (static_cast<uint32_t>(comparison_dcc >> 8u) << 24u),
+          static_cast<uint32_t>(comparison_dcc >> 16u)}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.written = true;
+      const auto color = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      (void)cache.FindTexture(color.image_id, color.desc);
+      vk::ClearValue paint{};
+      paint.color.float32 = std::array{0.375f, 0.f, 0.f, 0.f};
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), color.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, paint);
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.written = false;
+      resource.read = true;
+      resource.depth_compare = true;
+      auto comparison = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      (void)cache.FindTexture(comparison.image_id, comparison.desc);
+      const auto &depth = cache.GetImage(comparison.image_id);
+      Require(name, "expanded DCC comparison alias",
+              comparison.image_id != color.image_id &&
+                  depth.info.pixel_format == vk::Format::eD32Sfloat &&
+                  depth.info.guest_format == Prospero::BufferFormat::k32Float &&
+                  depth.info.tile_mode == Prospero::TileMode::kRenderTarget &&
+                  depth.info.extent == vk::Extent3D{64, 64, 1} &&
+                  depth.info.metadata.kind == ImageMetadataKind::Dcc &&
+                  depth.info.metadata.range == GuestRange{comparison_dcc, 0x1000} &&
+                  ReadCachedTexel(name, context, comparison.image_id) ==
+                      std::vector<u32>{std::bit_cast<u32>(0.375f)},
+              "comparison promotion lost native color data or guest DCC layout");
+      for (const u32 code : {0x40404040u, 0x80808080u}) {
+        WriteMetadata(context, comparison_dcc, 0x1000, code);
+        comparison = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        (void)cache.FindTexture(comparison.image_id, comparison.desc);
+        Require(name, "DCC clear on a comparison backing",
+                ReadCachedTexel(name, context, comparison.image_id, {63, 63, 0}) ==
+                    std::vector<u32>{code == 0x40404040u ? 0u : 0x3f800000u},
+                "DCC clear used the native depth format or color aspect");
+        std::array<uint8_t, 0x1000> metadata{};
+        Require(name, "comparison clear expands metadata",
+                LibKernel::Memory::TryReadBacking(comparison_dcc, metadata.data(),
+                                                 metadata.size()) &&
+                    std::ranges::all_of(metadata, [](uint8_t byte) { return byte == 0xff; }),
+                "comparison clear retained the native DCC clear key");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
     Require(name, "unmap",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "captured scene mapping release failed");
