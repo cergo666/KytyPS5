@@ -233,9 +233,6 @@ private:
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
-	// The stencil association images of each depth image (see AssociateStencil()); entries may be
-	// stale, users check the association's depth_id.
-	std::unordered_map<ImageId, std::vector<ImageId>> m_stencil_associations;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	static constexpr uint32_t                         ClearCheckCodes  = 8;
 	static constexpr uint32_t                         ClearCheckSlices = 64;
@@ -263,6 +260,9 @@ private:
 	// fields fixed at their creation, so an entry holds until a registration changes.
 	std::unordered_map<ExactImageKey, ExactImage, ExactImageKeyHash> m_exact_images;
 	uint64_t                                                         m_registration_generation = 1;
+	// The stencil association images of each depth image (see AssociateStencil()); entries may be
+	// stale, users check the association's depth_id.
+	std::unordered_map<ImageId, std::vector<ImageId>> m_stencil_associations;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
