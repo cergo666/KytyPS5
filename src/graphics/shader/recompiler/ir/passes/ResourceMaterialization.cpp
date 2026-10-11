@@ -1080,6 +1080,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
 	AssignEvaluationIndices(plan);
+	CompileSrtWalker(plan);
 	return plan;
 }
 

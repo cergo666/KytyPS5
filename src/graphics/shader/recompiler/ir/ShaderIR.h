@@ -22,6 +22,10 @@
 #include <string_view>
 #include <vector>
 
+namespace Xbyak {
+class CodeGenerator;
+}
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 enum class ResourceKind {
@@ -574,12 +578,12 @@ struct ResourcePlan {
 		uint64_t           generation = 0;
 	};
 
-	ResourcePlan() = default;
+	ResourcePlan();
 	~ResourcePlan();
 
 	ResourcePlan(const ResourcePlan&)            = delete;
 	ResourcePlan& operator=(const ResourcePlan&) = delete;
-	ResourcePlan(ResourcePlan&&) noexcept         = default;
+	ResourcePlan(ResourcePlan&&) noexcept;
 	ResourcePlan& operator=(ResourcePlan&& other) noexcept;
 
 	ShaderType                    stage           = ShaderType::Unknown;
@@ -601,6 +605,7 @@ struct ResourcePlan {
 	// ResolveInvariantPhi of every phi in value_storage, filled once by AssignEvaluationIndices and
 	// read-only afterwards, so concurrent evaluations need no locking (after upstream PR #955).
 	std::unordered_map<const Inst*, Value> invariant_phis;
+	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
