@@ -582,7 +582,7 @@ void CompileTreeWalker(ResourcePlan& program) {
 			if (reg < program.user_data_base ||
 			    RegIndex(high->Arg(0).ScalarRegister()) != reg + 1u) return;
 			const auto base = reg - program.user_data_base;
-			user_data_count = std::max(user_data_count, base + 2u);
+			user_data_count = std::max<uint32_t>(user_data_count, base + 2u);
 			uses = &roots[base];
 		} else {
 			const auto lo = offsets.find(low);
@@ -1010,7 +1010,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::UMin32:
 			if (binary()) {
-				result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				result = std::min<uint32_t>(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
 				return true;
 			}
 			return false;
