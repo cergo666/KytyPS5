@@ -35715,12 +35715,11 @@ TestCase ImageSampleOpcodeAliasUsesNormalCoords() {
   return test;
 }
 
-TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
+template <u32 wave_size> TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20,
-                1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+  AppendVMovU32(&code, 20, 1); // +1 X remains a full dword with A16 coordinates.
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -35731,18 +35730,63 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   AppendEnd(&code);
 
   auto image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+  SetRgbaPixel(&image, 4, 2, 1, 0x3f000000u, 0, 0, 0);
+  SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
   TestCase test;
-  test.name = "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu";
+  test.name = wave_size == 32 ? "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu32"
+                              : "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu64";
   test.code = code;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16"};
-  test.forbidden_spirv = {"OpBitFieldSExtract"};
+  test.required_spirv = {"UnpackHalf2x16", "Lod|ConstOffset"};
+  test.forbidden_spirv = {"OpBitFieldSExtract", "OpImageQuerySizeLod", "OpFDiv"};
+  return test;
+}
+
+template <u32 wave_size> TestCase ImageSampleOffsetsReadFourNeighbors() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 32 ? "ImageSampleOffsetsReadFourNeighbors32"
+                              : "ImageSampleOffsetsReadFourNeighbors64";
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  constexpr std::array offsets{0x01u, 0x3fu, 0x3f00u, 0x0100u};
+  constexpr std::array opcodes{0x37u, 0x37u, 0x34u, 0x32u};
+  for (u32 sample = 0; sample < offsets.size(); ++sample) {
+    AppendVMovLiteral(&test.code, 20, offsets[sample]);
+    u32 coordinate = 21;
+    if (opcodes[sample] == 0x32u) {
+      for (float gradient : {0.25f, 0.f, 0.f, 0.25f}) {
+        AppendVMovLiteral(&test.code, coordinate++, std::bit_cast<u32>(gradient));
+      }
+    }
+    // All instructions address the center of texel (2, 1) before applying the offset.
+    AppendVMovLiteral(&test.code, coordinate, std::bit_cast<u32>(0.625f));
+    AppendVMovLiteral(&test.code, coordinate + 1, std::bit_cast<u32>(0.375f));
+    if (opcodes[sample] == 0x34u) AppendVMovU32(&test.code, coordinate + 2, 0);
+    test.code.push_back(EncodeMimg0(opcodes[sample], 0x1));
+    test.code.push_back(EncodeMimg1(sample, 20));
+    AppendStoreVgpr(&test.code, sample, sample);
+  }
+  AppendEnd(&test.code);
+  test.sampled_image_rgba = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&test.sampled_image_rgba, 4, 2, 1, std::bit_cast<u32>(16.f), 0, 0, 0);
+  constexpr std::array<std::array<u32, 2>, 4> neighbors{{{3, 1}, {1, 1}, {2, 0}, {2, 2}}};
+  for (u32 sample = 0; sample < neighbors.size(); ++sample) {
+    const auto value = std::bit_cast<u32>(float(sample + 1));
+    SetRgbaPixel(&test.sampled_image_rgba, 4, neighbors[sample][0], neighbors[sample][1],
+                 value, 0, 0, 0);
+    test.expected.push_back(value);
+  }
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"Lod|ConstOffset", "Grad|ConstOffset"};
+  test.forbidden_spirv = {"OpImageQuerySizeLod", "OpFDiv", "OpBitFieldSExtract", "OpSwitch"};
   return test;
 }
 
@@ -35813,7 +35857,8 @@ TestCase ImageGatherCompareOpcodes() {
       O::V_MOV_B32,         O::IMAGE_GATHER4_C,      O::IMAGE_GATHER4_C_LZ,
       O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
       O::S_ENDPGM};
-  test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
+  test.required_spirv = {"OpImageDrefGather", "ConstOffset"};
+  test.forbidden_spirv = {"OpBitFieldSExtract"};
   test.compile_only = true;
   return test;
 }
@@ -36365,7 +36410,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
   auto &sample = block->AppendNewInst(
       ValueOpcode::ImageSampleRaw,
-      {Value(&image), Value(&sampler), Value(&address)}, memory_flag_bits);
+      {Value(&image), Value(&sampler), Value(&address), Value(true)}, memory_flag_bits);
   auto &sample_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
                                         {Value(&sample), Value(0u)});
   block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&sample_x)});
@@ -36591,7 +36636,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       auto &read = *block->PrependNewInst(
           position, ValueOpcode::ImageGatherRaw,
           {Value(&image), Value(&sampler), Value(&address), Value(0u), Value(0u),
-           Value(0u), Value(0u)}, memory_flag_bits);
+           Value(0u), Value(0u), Value(true)}, memory_flag_bits);
       access->ReplaceUsesWith(Value(&read), false);
       access = &read;
       compiled.program.info.images[4].cube = false;
@@ -38527,7 +38572,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
-  AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
+  AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<32>);
+  AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<64>);
+  AddCase(ImageSampleOffsetsReadFourNeighbors<32>);
+  AddCase(ImageSampleOffsetsReadFourNeighbors<64>);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
@@ -41375,7 +41423,7 @@ void CheckImageSamplerSpecialization() {
               sizeof(signed_memory_flags));
   mixed_sampler_block->AppendNewInst(
       ValueOpcode::ImageSampleRaw,
-      {Value(&image_handle), Value(&sampler_handle), Value(&image_address)},
+      {Value(&image_handle), Value(&sampler_handle), Value(&image_address), Value(true)},
       signed_memory_flag_bits);
 
   ShaderRecompiler::IR::DescriptorValue native_image_descriptor{};
@@ -44603,6 +44651,16 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
     RunCase(&vulkan, BufferStoreFormatXAddTidUsesLaneIndex());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-sample-offset-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageSampleOffsetsReadFourNeighbors<32>());
+    RunCase(&vulkan, ImageSampleOffsetsReadFourNeighbors<64>());
+    RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<32>());
+    RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<64>());
+    RunCase(&vulkan, ImageSampleAndGather());
+    RunCase(nullptr, ImageGatherCompareOpcodes());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-gather-lod-only") == 0) {

@@ -323,25 +323,25 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	return vector;
 }
 
-uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                      const ImageSampleLayout& layout, ImageDimension dimension) {
+uint32_t PackedOffset(ValueEmitContext& ctx, IR::Value value, ImageDimension dimension,
+                      uint32_t& mask) {
 	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
-	const auto zero       = ConstantI32(ctx.state, 0);
-	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
-		if (components == 1u) return zero;
-		const auto result = ctx.state.builder.AllocateId();
-		if (components == 3u) {
-			ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, 3),
-			                              result, zero, zero, zero);
-		} else {
-			ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, 2),
-			                              result, zero, zero);
+	uint32_t values[3] {};
+	if (value.IsImmediate()) {
+		// RDNA2 packs signed six-bit texel offsets into the low bits of each byte.
+		for (uint32_t index = 0; index < components; index++) {
+			const auto bits = (value.U32() >> (index * 8u)) & 0x3fu;
+			values[index] = ConstantI32(ctx.state, static_cast<int32_t>(bits ^ 0x20u) - 0x20);
 		}
-		return result;
+		mask |= spv::ImageOperandsConstOffsetMask;
+		return components == 1u
+		           ? values[0]
+		           : ctx.state.builder.Constant(spv::OpConstantComposite,
+		                                        TypeI32Vector(ctx.state, components),
+		                                        std::span(values).first(components));
 	}
-	const auto packed    = Unary(ctx.state, spv::OpBitcast, TypeI32(ctx.state),
-	                             AddressU32(ctx, mem, address, layout.offset));
-	uint32_t   values[3] = {zero, zero, zero};
+	mask |= spv::ImageOperandsOffsetMask;
+	const auto packed = Unary(ctx.state, spv::OpBitcast, TypeI32(ctx.state), ctx.Def(value));
 	for (uint32_t index = 0; index < components; index++) {
 		values[index] = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(ctx.state), values[index],
@@ -350,13 +350,8 @@ uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR
 	}
 	if (components == 1u) return values[0];
 	const auto result = ctx.state.builder.AllocateId();
-	if (components == 3u) {
-		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, 3),
-		                              result, values[0], values[1], values[2]);
-	} else {
-		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, 2),
-		                              result, values[0], values[1]);
-	}
+	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, components),
+	                              result, std::span(values).first(components));
 	return result;
 }
 
@@ -799,6 +794,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto  layout         = Layout(mem);
 		const auto  numeric_class  = image.numeric_class;
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+		IR::Value offset_value;
+		if (layout.offset != NoImageComponent) {
+			const auto value = address->Arg(layout.offset).Resolve();
+			offset_value = IR::ResolveActiveU32(value, inst.Arg(inst.NumArgs() - 1u).Resolve());
+			if (offset_value.IsEmpty()) offset_value = value;
+		}
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a converted image");
@@ -848,8 +849,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					operand_mask = spv::ImageOperandsConstOffsetsMask;
 					offset = HorizontalOffsets(state, dimension);
 				} else if (layout.offset != NoImageComponent) {
-					operand_mask = spv::ImageOperandsOffsetMask;
-					offset = PackedOffset(ctx, mem, *address, layout, dimension);
+					offset = PackedOffset(ctx, offset_value, dimension, operand_mask);
 				}
 				const auto EmitMip = [&](uint32_t mip) {
 					const auto sampled = MakeSampledImage(state, resource, sampler_id, mip, array_index);
@@ -891,7 +891,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
-		std::array<uint32_t, 3> operands {};
+		std::array<uint32_t, 4> operands {};
 		size_t operand_count = 0;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 			operands[0] = spv::ImageOperandsGradMask;
@@ -921,9 +921,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    state, ctx.Def(handle->Arg(0)), static_cast<uint32_t>(samplers.size()),
 			    TypeU32(state), [&](uint32_t ordinal) { return ConstantU32(state, samplers[ordinal]); });
 		}
+		if (layout.offset != NoImageComponent &&
+		    !offset_value.IsImmediate()) {
+			ctx.Fail(inst, "has a nonconstant sample texel offset");
+		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
+			auto sample_operands = operands;
+			auto sample_operand_count = operand_count;
+			if (layout.offset != NoImageComponent) {
+				sample_operand_count = std::max(size_t{1}, sample_operand_count);
+				sample_operands[sample_operand_count++] = PackedOffset(
+				    ctx, offset_value, candidate.dimension, sample_operands[0]);
+			}
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
@@ -933,7 +944,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto sample = state.builder.AllocateId();
 			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),
-			                          std::span<const uint32_t>(operands).first(operand_count));
+			                          std::span<const uint32_t>(sample_operands).first(sample_operand_count));
 			return sample;
 		};
 		auto result = EmitImageAccess(ctx, inst, result_type, EmitSample);
