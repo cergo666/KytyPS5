@@ -36522,29 +36522,63 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
         resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers));
   }
   const auto native_sampler = vulkan.CreateSampler(test.name);
-  for (const bool fetch : {false, true}) {
+  enum class Access { Sample, Gather, GatherHomogeneous, Fetch };
+  auto *access = &sample;
+  for (const auto mode : {Access::Sample, Access::Gather,
+                          Access::GatherHomogeneous, Access::Fetch}) {
+    const bool fetch = mode == Access::Fetch;
+    const bool gather = mode == Access::Gather || mode == Access::GatherHomogeneous;
+    const bool homogeneous = mode == Access::GatherHomogeneous;
+    if (mode == Access::Gather) {
+      test.name = "IndirectImageGatherContiguousRuns";
+      const auto position = std::ranges::find_if(*block, [&](const Inst &inst) {
+        return &inst == access;
+      });
+      auto &read = *block->PrependNewInst(
+          position, ValueOpcode::ImageGatherRaw,
+          {Value(&image), Value(&sampler), Value(&address), Value(0u), Value(0u),
+           Value(0u), Value(0u)}, memory_flag_bits);
+      access->ReplaceUsesWith(Value(&read), false);
+      access = &read;
+      compiled.program.info.images[4].cube = false;
+      auto &gather_memory = compiled.program.memory_info[0];
+      gather_memory.dmask = 1;
+      gather_memory.image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLevelZero |
+          ShaderRecompiler::Decoder::ImageSampleFlagOffset;
+      // GATHER4_LZ_O places its packed signed offset before the coordinates.
+      address.SetArg(0, Value(0x3fu));
+      address.SetArg(1, Value(std::bit_cast<u32>(0.75f)));
+      address.SetArg(2, Value(std::bit_cast<u32>(0.25f)));
+      address.SetArg(3, Value(0u));
+    }
+    auto &selected_resources = compiled.program.info.images[0].indirect_resources;
+    selected_resources = homogeneous ? std::vector<u32>{0u, 2u, 3u, 5u, 6u}
+                                     : root.indirect_resources;
+    if (homogeneous) test.name = "IndirectImageGatherHomogeneous";
+    compiled.resources.flattened_srt[6] = homogeneous ? 4u : ordinals[5];
     if (fetch) {
       test.name = "IndirectImageFetchContiguousRuns";
       const auto position = std::ranges::find_if(*block, [&](const Inst &inst) {
-        return &inst == &sample;
+        return &inst == access;
       });
       auto &read = *block->PrependNewInst(
           position, ValueOpcode::ImageRead,
           {Value(&image), Value(&address), Value(true)}, memory_flag_bits);
-      sample.ReplaceUsesWith(Value(&read), false);
+      access->ReplaceUsesWith(Value(&read), false);
       sampler.Invalidate();
       compiled.program.info.samplers.clear();
       compiled.program.info.sampled_pairs.clear();
       compiled.program.info.images[4].cube = false;
+      compiled.program.memory_info[0].dmask = 0xf;
       compiled.program.memory_info[0].image_sample_flags = 0;
       compiled.program.memory_info[0].image_has_mip = true;
       for (u32 component = 0; component < 4u; ++component)
         address.SetArg(component, Value(0u));
       // Native DIM=2DArray places LOD after the layer, even for a 2D candidate.
       address.SetArg(3, Value(1u));
-      compiled.program.shader_info_complete = false;
-      CollectShaderInfo(compiled.program, {.compute = &compute});
     }
+    compiled.program.shader_info_complete = false;
+    CollectShaderInfo(compiled.program, {.compute = &compute});
     for (const u32 wave_size : {32u, 64u}) {
       compute.wave_size = wave_size;
       compute.host_subgroup_size = vulkan.SubgroupSize();
@@ -36555,31 +36589,38 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
       ValidateSpirv(test.name, compiled.spirv);
       const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      const auto image_opcode = fetch ? "OpImageFetch" : gather ? "OpImageGather"
+                                                          : "OpImageSampleExplicitLod";
       Require(test.name, "native array image runs", tools.Disassemble(compiled.spirv, &text) &&
-                  CountText(text, fetch ? "OpImageFetch" : "OpImageSampleExplicitLod") == 3u * halves,
+                  CountText(text, image_opcode) == (homogeneous ? 1u : 3u) * halves,
               "mixed runs expanded into per-image accesses");
-      if (fetch) {
+      if (homogeneous) {
+        Require(test.name, "homogeneous gather array", text.find("OpSwitch") == std::string::npos,
+                "homogeneous gather emitted a descriptor switch");
+      }
+      if (fetch || gather) {
         std::vector<u32> decorated;
-        std::vector<u32> fetched_images;
+        std::vector<u32> image_operands;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span<const u32>(compiled.spirv).subspan(
               offset, compiled.spirv[offset] >> 16u);
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
           if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
             decorated.push_back(words[1]);
-          if (opcode == spv::OpImageFetch) fetched_images.push_back(words[3]);
+          if (opcode == (fetch ? spv::OpImageFetch : spv::OpImageGather))
+            image_operands.push_back(words[3]);
           offset += words.size();
         }
-        Require(test.name, "nonuniform fetch operands",
-                std::ranges::count_if(fetched_images, [&](u32 operand) {
+        Require(test.name, "nonuniform image operands",
+                std::ranges::count_if(image_operands, [&](u32 operand) {
                   return std::ranges::find(decorated, operand) != decorated.end();
-                }) == 2u * halves,
-                "a dynamically selected fetch image lacks its nonuniform decoration");
+                }) == (homogeneous ? 1u : 2u) * halves,
+                "a dynamically selected image operand lacks its nonuniform decoration");
       }
       test.initial.assign(wave_size, 0xdeadbeefu);
       test.expected.assign(wave_size, 0u);
       for (u32 lane = 0; lane < ordinals.size(); ++lane) {
-        const auto resource = root.indirect_resources[ordinals[lane]];
+        const auto resource = selected_resources[compiled.resources.flattened_srt[1u + lane]];
         test.expected[lane] = std::bit_cast<u32>(float(resource + (fetch && resource != 0u ? 10u : 0u)));
       }
       auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
@@ -36587,7 +36628,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
                       fetch ? vk::Sampler{} : native_sampler, textures);
       const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
       vulkan.DestroyBuffer(&buffer);
-      CompareWords(test, "root, native slots, cube and mapping bounds", test.expected, actual);
+      CompareWords(test, "root, native slots, array runs and mapping bounds", test.expected, actual);
     }
     std::printf("[compute] %-32s ok\n", test.name);
   }
