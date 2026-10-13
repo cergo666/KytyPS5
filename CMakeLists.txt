@@ -40,6 +40,11 @@ if (NOT (WIN32 OR LINUX OR APPLE))
     message(FATAL_ERROR "only Windows, Linux, and macOS builds are supported")
 endif()
 
+if(WIN32)
+	# Prevent Windows headers from defining min/max macros in all targets (upstream 16a7fe68).
+	add_compile_definitions(NOMINMAX)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
