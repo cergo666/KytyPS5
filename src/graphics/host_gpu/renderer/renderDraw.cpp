@@ -1149,6 +1149,10 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+static uint32_t stage_count_for_diag(const DrawRenderState& state) {
+	return state.programs.VertexStageCount();
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw_in, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit_in,
@@ -1169,6 +1173,48 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	KYTY_WAIT_SCOPE(draw_category);
+	{
+		// KYTY_DIAG_SHADOWDRAWS=1: once per vertex shader of depth-only square passes, what the
+		// draw binds (the input for a GPU-driven multi-draw path).
+		static const bool diag = std::getenv("KYTY_DIAG_SHADOWDRAWS") != nullptr;
+		static std::vector<uint64_t> seen;
+		if (diag && state.color_count == 0 && !state.ps_active &&
+		    state.vertex_info[0].stage.program != nullptr) {
+			const auto& program = *state.vertex_info[0].stage.program;
+			const auto  hash    = program.shader_hash;
+			if (std::find(seen.begin(), seen.end(), hash) == seen.end() && seen.size() < 24) {
+				seen.push_back(hash);
+				std::printf("SHADOWDRAW vs=0x%llx stages=%u indexed=%d idx=%u inst=%u restart=%d topology=%d "
+				            "fetch_embedded=%d vbuf=%d resnum=%d dma=%d addr_writes=%d push=%d "
+				            "shader_data_dwords=%u user_regs=%zu\n",
+				            static_cast<unsigned long long>(hash), stage_count_for_diag(state),
+				            draw_in.IsIndexed() ? 1 : 0, draw_in.index_count, draw_in.instance_count,
+				            primitive_restart_enable ? 1 : 0, static_cast<int>(topology),
+				            state.vertex_info[0].fetch_embedded ? 1 : 0, state.vertex_info[0].buffers_num,
+				            state.vertex_info[0].resources_num, program.info.uses_dma ? 1 : 0,
+				            program.has_address_writes ? 1 : 0, program.bindings.UsesPushData() ? 1 : 0,
+				            program.bindings.ShaderDataDwords(), program.info.user_data_registers.size());
+				std::printf("SHADOWDRAW   bindings:");
+				for (size_t kind = 0; kind < program.bindings.descriptor_counts.size(); ++kind) {
+					if (program.bindings.descriptor_counts[kind] != 0) {
+						std::printf(" [%zu]=%u", kind, program.bindings.descriptor_counts[kind]);
+					}
+				}
+				std::printf("\n");
+				for (const auto& resource: program.info.buffers) {
+					std::printf("SHADOWDRAW   buffer idx=%u read=%d written=%d atomic=%d formatted=%d scalar=%d "
+					            "stride=%u extent=%u\n",
+					            resource.descriptor_index, resource.read ? 1 : 0, resource.written ? 1 : 0,
+					            resource.atomic ? 1 : 0, resource.formatted ? 1 : 0, resource.scalar ? 1 : 0,
+					            resource.packed_stride, resource.max_byte_extent);
+				}
+				std::printf("SHADOWDRAW   images=%zu samplers=%zu inputs=%zu outputs=%zu\n",
+				            program.info.images.size(), program.info.samplers.size(),
+				            program.info.inputs.size(), program.info.outputs.size());
+				std::fflush(stdout);
+			}
+		}
+	}
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
