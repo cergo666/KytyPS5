@@ -17,7 +17,7 @@ unsigned RecommendedShadowEvery() {
 void AdaptiveQuality(double fps) {
 	static const bool enabled = [] {
 		const char* env = std::getenv("KYTY_ADAPTIVE_SHADOWS");
-		return env == nullptr || env[0] != '0';
+		return env != nullptr && env[0] == '1'; // off by default: skipping shadow updates flickers
 	}();
 	if (!enabled || fps < 5.0) { // loading and menus' transitions say nothing about the scene
 		return;
