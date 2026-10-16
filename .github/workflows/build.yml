@@ -440,7 +440,7 @@ jobs:
     if: >-
       always() &&
       github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      github.repository == 'cergo666/KytyPS5' &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
